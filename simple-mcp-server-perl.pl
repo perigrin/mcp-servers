@@ -38,8 +38,7 @@ sub process_buffer {
 }
 
 # Handle incoming messages
-sub handle_message {
-    my ($message) = @_;
+sub handle_message ($message) {
 
     # Validate JSON-RPC version
     if ( !exists $message->{jsonrpc} || $message->{jsonrpc} ne "2.0" ) {
@@ -65,8 +64,7 @@ sub handle_message {
 }
 
 # Handle incoming requests
-sub handle_request {
-    my ($request) = @_;
+sub handle_request ($request) {
 
     my $method = $request->{method};
 
@@ -85,8 +83,7 @@ sub handle_request {
 }
 
 # Handle initialize request
-sub handle_initialize {
-    my ($request) = @_;
+sub handle_initialize ($request) {
 
     my $response = {
         jsonrpc => "2.0",
@@ -116,8 +113,7 @@ sub handle_initialize {
 }
 
 # Handle tools/list request
-sub handle_list_tools {
-    my ($request) = @_;
+sub handle_list_tools ($request) {
 
     my $response = {
         jsonrpc => "2.0",
@@ -157,8 +153,7 @@ sub handle_list_tools {
 }
 
 # Handle tools/call request
-sub handle_call_tool {
-    my ($request) = @_;
+sub handle_call_tool ($request) {
 
     my $name = $request->{params}{name};
     my $args = $request->{params}{arguments};
@@ -239,20 +234,18 @@ sub handle_call_tool {
 }
 
 # Send a JSON-RPC message
-sub send_message {
-    my ($message) = @_;
+sub send_message ($message) {
 
     my $message_json = encode_json($message);
     print "$message_json\n";
 }
 
 # Send a JSON-RPC error
-sub send_error {
-    my ( $code, $message, $id ) = @_;
+sub send_error ( $code, $message, $id ) {
 
     my $error = {
         jsonrpc => "2.0",
-        id      => $id // JSON::PP::null,
+        id      => 0 + $id,
         error   => {
             code    => $code,
             message => $message
@@ -263,14 +256,12 @@ sub send_error {
 }
 
 # Log a message to stderr for debugging
-sub log_message {
-    my ($message) = @_;
+sub log_message ($message) {
     print STDERR "[MCP Server] $message\n";
 }
 
 # Optional: send a logging notification to the client
-sub send_log_notification {
-    my ( $level, $message ) = @_;
+sub send_log_notification ( $level, $message ) {
 
     my $notification = {
         jsonrpc => "2.0",
