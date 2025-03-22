@@ -1,9 +1,8 @@
 #!/usr/bin/env perl
-use 5.40.0;
+use 5.38.0;  # Downgraded from 5.40.0 for wider compatibility
 use experimental qw(class try builtin);
 
 use FindBin;
-use local::lib "$FindBin::Bin/local";
 use IO::Handle;
 
 # Set stdout and stderr to be unbuffered
@@ -262,26 +261,13 @@ class MCPServer {
     field $SERVER_NAME      = "mcp-fetch";
     field $SERVER_VERSION   = "1.0.0";
 
-    # Method handlers for dispatch
-    field %method_handlers = (
-        "initialize"  => method($req) { $self->handle_initialize($req) },
-        "initialized" =>
-          sub ($req) { $logger->log("Received 'initialized' notification") },
-        "tools/list"   => method($req) { $self->handle_list_tools($req) },
-        "tools/call"   => method($req) { $self->handle_call_tool($req) },
-        "prompts/list" => method($req) { $self->handle_list_prompts($req) },
-        "prompts/get"  => method($req) { $self->handle_get_prompt($req) },
-        "shutdown"     => method($req) { $self->handle_shutdown($req) },
-        "exit"         =>
-          method($req) { $logger->log("Received exit notification"); exit(0) }
-    );
-
     method run {
         $logger->log("Starting MCP Fetch server...");
         $logger->log("Server ready. Waiting for input...");
 
         # Simple line-by-line processing loop
-        while ( my $line = <STDIN> ) {
+        while (my $line = <STDIN>) {
+            $logger->log("Received raw input line of length: " . length($line));
             $buffer .= $line;
             $self->process_buffer();
         }
@@ -290,27 +276,25 @@ class MCPServer {
     }
 
     method process_buffer {
-
         # Process line-by-line (each message is on a separate line)
-        while ( $buffer =~ s/^(.*)\n// ) {
+        while ($buffer =~ s/^(.*)\n//) {
             my $line = $1;
             next unless $line =~ /\S/;    # Skip empty lines
-
-            $logger->log("Received message: $line");
-
+            
+            $logger->log("Processing line: $line");
+            
             try {
-                my $msg = decode_json($line);
-                $self->handle_message($msg);
+                my $message = decode_json($line);
+                $self->handle_message($message);
             }
             catch ($e) {
                 $logger->log("Parse error: $e");
-                $self->send_error( -32700, "Parse error", undef );
+                $self->send_error(-32700, "Parse error", 0);  # Use 0 instead of undef
             }
         }
     }
 
     method handle_message($msg) {
-
         # Validate JSON-RPC version
         if ( !exists $msg->{jsonrpc} || $msg->{jsonrpc} ne "2.0" ) {
             $self->send_error( -32600, "Invalid Request", $msg->{id} );
@@ -321,12 +305,10 @@ class MCPServer {
         if ( exists $msg->{method} ) {
             $self->handle_request($msg);
         }
-
         # We're not expecting responses in this simple server
         elsif ( exists $msg->{result} || exists $msg->{error} ) {
             $logger->log("Received response/error message (not handling)");
         }
-
         # Invalid message
         else {
             $logger->log("Invalid message format");
@@ -338,13 +320,35 @@ class MCPServer {
         my $method = $req->{method};
         $logger->log("Handling request method: $method");
 
-        if ( exists $method_handlers{$method} ) {
-            $method_handlers{$method}->($req);
+        if ($method eq "initialize") {
+            $self->handle_initialize($req);
+        }
+        elsif ($method eq "initialized") {
+            $logger->log("Received 'initialized' notification");
+            # No response needed for notifications
+        }
+        elsif ($method eq "tools/list") {
+            $self->handle_list_tools($req);
+        }
+        elsif ($method eq "tools/call") {
+            $self->handle_call_tool($req);
+        }
+        elsif ($method eq "prompts/list") {
+            $self->handle_list_prompts($req);
+        }
+        elsif ($method eq "prompts/get") {
+            $self->handle_get_prompt($req);
+        }
+        elsif ($method eq "shutdown") {
+            $self->handle_shutdown($req);
+        }
+        elsif ($method eq "exit") {
+            $logger->log("Received exit notification");
+            exit(0);
         }
         else {
             $logger->log("Method not found: $method");
-            $self->send_error( -32601, "Method not found: $method",
-                $req->{id} );
+            $self->send_error(-32601, "Method not found: $method", $req->{id});
         }
     }
 
@@ -361,15 +365,15 @@ class MCPServer {
                     version => $SERVER_VERSION
                 },
                 capabilities => {
-                    tools   => { listChanged => true },
-                    prompts => { listChanged => true }
+                    tools => { listChanged => true }
+                    # Removed prompts capability for troubleshooting
                 }
             }
         };
 
         $self->send_message($response);
 
-        # Send initialized notification right after initialization
+        # Send initialized notification after successful initialization
         my $notification = {
             jsonrpc => "2.0",
             method  => "initialized",
@@ -488,24 +492,12 @@ class MCPServer {
     method handle_list_prompts($request) {
         $logger->log("Handling prompts/list request");
 
+        # Since we're not declaring prompts capability, we should still respond properly
         my $response = {
             jsonrpc => "2.0",
             id      => $request->{id},
             result  => {
-                prompts => [
-                    {
-                        name        => "fetch",
-                        description =>
-                          "Fetch a URL and extract its contents as markdown",
-                        arguments => [
-                            {
-                                name        => "url",
-                                description => "URL to fetch",
-                                required    => true
-                            }
-                        ]
-                    }
-                ]
+                prompts => []  # Empty array since we're disabling prompts temporarily
             }
         };
 
@@ -514,65 +506,13 @@ class MCPServer {
 
     method handle_get_prompt($request) {
         $logger->log("Handling prompts/get request");
-
-        my $prompt_name = $request->{params}{name}      // '';
-        my $prompt_args = $request->{params}{arguments} // {};
-
-        $logger->log(
-            "Prompt: $prompt_name, Arguments: " . encode_json($prompt_args) );
-
-        if ( $prompt_name eq "fetch" ) {
-            try {
-                my $result =
-                  $fetch_service->process_prompt_request($prompt_args);
-
-                my $response = {
-                    jsonrpc => "2.0",
-                    id      => $request->{id},
-                    result  => {
-                        description => "Contents of " . $prompt_args->{url},
-                        messages    => [
-                            {
-                                role    => "user",
-                                content => {
-                                    type => "text",
-                                    text => $result
-                                }
-                            }
-                        ]
-                    }
-                };
-
-                $self->send_message($response);
-            }
-            catch ($e) {
-                $logger->log("Error handling prompt: $e");
-
-                my $response = {
-                    jsonrpc => "2.0",
-                    id      => $request->{id},
-                    result  => {
-                        description => "Failed to fetch " . $prompt_args->{url},
-                        messages    => [
-                            {
-                                role    => "user",
-                                content => {
-                                    type => "text",
-                                    text => "Error: $e"
-                                }
-                            }
-                        ]
-                    }
-                };
-
-                $self->send_message($response);
-            }
-        }
-        else {
-            $logger->log("Prompt not found: $prompt_name");
-            $self->send_error( -32601, "Prompt not found: $prompt_name",
-                $request->{id} );
-        }
+        
+        # Since we're not supporting prompts right now, return an error
+        $self->send_error(
+            -32601,
+            "Method not supported: prompts are temporarily disabled",
+            $request->{id}
+        );
     }
 
     method handle_shutdown($request) {
@@ -599,23 +539,26 @@ class MCPServer {
     }
 
     # Send a JSON-RPC error
-    method send_error( $code, $message, $id ) {
+    method send_error($code, $message, $id) {
         $logger->log("Sending error: $message (code: $code)");
-
+        
+        # Ensure id is never null/undef
+        $id = 0 unless defined $id;
+        
         my $error = {
             jsonrpc => "2.0",
-            id      => 0 + $id,
+            id      => $id,
             error   => {
                 code    => $code,
                 message => $message
             }
         };
-
+        
         $self->send_message($error);
     }
 
     # Optional: send a logging notification to the client
-    method send_log_notification( $level, $message ) {
+    method send_log_notification ( $level, $message ) {
         my $notification = {
             jsonrpc => "2.0",
             method  => "notifications/logging/message",
@@ -703,12 +646,6 @@ To integrate with Claude Desktop:
 This server provides one tool:
 
 1. fetch - Fetches a URL and extracts its contents
-
-=head1 AVAILABLE PROMPTS
-
-This server provides one prompt:
-
-1. fetch - Fetches a URL as a user-initiated request
 
 =head1 REQUIRED MODULES
 
