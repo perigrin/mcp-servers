@@ -2,6 +2,7 @@
 use 5.38.0;
 use JSON::PP;
 use IO::Handle;
+use Log::Log4perl::Tiny qw(:easy);
 
 # Make sure stdout is unbuffered
 STDOUT->autoflush(1);
@@ -255,9 +256,18 @@ sub send_error ( $code, $message, $id ) {
     send_message($error);
 }
 
-# Log a message to stderr for debugging
-sub log_message ($message) {
-    print STDERR "[MCP Server] $message\n";
+# Set format to include [MCP Server] prefix
+Log::Log4perl->easy_init(
+    {
+        layout => '[MCP Server] %m%n',
+        level  => $ENV{DEBUG} ? $DEBUG : $INFO,
+        ( $ENV{LOG_FILE} ? ( file => $ENV{LOG_FILE} ) : () )
+    }
+);
+
+# Log a message to stderr for debugging using Log::Log4perl::Tiny
+sub log_message ( $message, $level = 'info' ) {
+    get_logger()->$level($message);
 }
 
 # Optional: send a logging notification to the client

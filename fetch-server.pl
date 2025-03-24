@@ -1,28 +1,28 @@
 #!/usr/bin/env perl
-use 5.38.0;  # Downgraded from 5.40.0 for wider compatibility
+use 5.38.0;    # Downgraded from 5.40.0 for wider compatibility
 use experimental qw(class try builtin);
 use lib::xi;
 
 use FindBin;
 use IO::Handle;
+use Log::Log4perl::Tiny qw(:easy);
 
 # Set stdout and stderr to be unbuffered
 STDOUT->autoflush(1);
 STDERR->autoflush(1);
 
-# Logger class for handling logging
-class Logger {
-    field $file :param = $ENV{LOG_FILE};
-    ADJUST {
-        if ($file) {
-            open STDERR, ">>", $file or die "Failed to open log file: $!";
-        }
+Log::Log4perl->easy_init(
+    {
+        layout => '[MCP Server] %m%n',
+        level  => $ENV{DEBUG} ? $DEBUG : $INFO,
+        ( $ENV{LOG_FILE} ? ( file => $ENV{LOG_FILE} ) : () )
     }
+);
 
-    method log($message) {
-        say STDERR "[MCP Fetch Server] $message";
-    }
-}
+# Protocol constants
+my $PROTOCOL_VERSION = "2024-11-05";
+my $SERVER_NAME      = "mcp-fetch";
+my $SERVER_VERSION   = "1.0.0";
 
 # Configuration class
 class FetchConfig {
@@ -43,14 +43,13 @@ class FetchService {
     use builtin  qw(true false);
 
     field $config :param;
-    field $logger :param;
 
     # Default user agents
     field $user_agent_autonomous = $ENV{CUSTOM_USER_AGENT}
       // "ModelContextProtocol/1.0 (Autonomous; +https://github.com/modelcontextprotocol/servers)";
     field $user_agent_manual = $ENV{CUSTOM_USER_AGENT}
       // "ModelContextProtocol/1.0 (User-Specified; +https://github.com/modelcontextprotocol/servers)";
-    field $ignore_robots_txt :param = $ENV{IGNORE_ROBOTS_TXT} // 0;
+    field $ignore_robots_txt = $ENV{IGNORE_ROBOTS_TXT} // 0;
 
     # HTTP client
     field $http = HTTP::Tiny->new(
@@ -72,7 +71,7 @@ class FetchService {
         return 1 if $ignore_robots_txt;
 
         my $robots_url = $self->get_robots_txt_url($url);
-        $logger->log("Checking robots.txt at: $robots_url");
+        main::DEBUG("Checking robots.txt at: $robots_url");
 
         my $response = $http->get($robots_url);
 
@@ -147,7 +146,7 @@ class FetchService {
 
     # Fetch a URL and return the content
     method fetch_url( $url, $user_agent, $force_raw = 0 ) {
-        $logger->log("Fetching URL: $url");
+        main::DEBUG("Fetching URL: $url");
 
         my $response = $http->get(
             $url,
@@ -253,49 +252,47 @@ class MCPServer {
     use builtin  qw(true false);
 
     field $config :param;
-    field $logger :param;
-    field $fetch_service :param;
-    field $buffer = '';
-
-    # Protocol constants
-    field $PROTOCOL_VERSION = "2024-11-05";
-    field $SERVER_NAME      = "mcp-fetch";
-    field $SERVER_VERSION   = "1.0.0";
+    field $fetch_service = FetchService->new( config => $config );
+    field $buffer        = '';
 
     method run {
-        $logger->log("Starting MCP Fetch server...");
-        $logger->log("Server ready. Waiting for input...");
+        main::INFO("Starting MCP Fetch server...");
+        main::INFO("Server ready. Waiting for input...");
 
         # Simple line-by-line processing loop
-        while (my $line = <STDIN>) {
-            $logger->log("Received raw input line of length: " . length($line));
+        while ( my $line = <STDIN> ) {
+            main::DEBUG(
+                "Received raw input line of length: " . length($line) );
             $buffer .= $line;
             $self->process_buffer();
         }
 
-        $logger->log("Server shutting down...");
+        main::ERROR("Server shutting down...");
     }
 
     method process_buffer {
+
         # Process line-by-line (each message is on a separate line)
-        while ($buffer =~ s/^(.*)\n//) {
+        while ( $buffer =~ s/^(.*)\n// ) {
             my $line = $1;
             next unless $line =~ /\S/;    # Skip empty lines
 
-            $logger->log("Processing line: $line");
+            main::DEBUG("Processing line: $line");
 
             try {
                 my $message = decode_json($line);
                 $self->handle_message($message);
             }
             catch ($e) {
-                $logger->log("Parse error: $e");
-                $self->send_error(-32700, "Parse error", 0);  # Use 0 instead of undef
+                main::ERROR("Parse error: $e");
+                $self->send_error( -32700, "Parse error", 0 )
+                  ;    # Use 0 instead of undef
             }
         }
     }
 
     method handle_message($msg) {
+
         # Validate JSON-RPC version
         if ( !exists $msg->{jsonrpc} || $msg->{jsonrpc} ne "2.0" ) {
             $self->send_error( -32600, "Invalid Request", $msg->{id} );
@@ -306,55 +303,59 @@ class MCPServer {
         if ( exists $msg->{method} ) {
             $self->handle_request($msg);
         }
+
         # We're not expecting responses in this simple server
         elsif ( exists $msg->{result} || exists $msg->{error} ) {
-            $logger->log("Received response/error message (not handling)");
+            main::DEBUG("Received response/error message (not handling)");
         }
+
         # Invalid message
         else {
-            $logger->log("Invalid message format");
+            main::ERROR("Invalid message format");
             $self->send_error( -32600, "Invalid Request", $msg->{id} );
         }
     }
 
     method handle_request($req) {
         my $method = $req->{method};
-        $logger->log("Handling request method: $method");
+        main::INFO("Handling request method: $method");
 
-        if ($method eq "initialize") {
+        if ( $method eq "initialize" ) {
             $self->handle_initialize($req);
         }
-        elsif ($method eq "initialized") {
-            $logger->log("Received 'initialized' notification");
+        elsif ( $method eq "initialized" ) {
+            main::INFO("Received 'initialized' notification");
+
             # No response needed for notifications
         }
-        elsif ($method eq "tools/list") {
+        elsif ( $method eq "tools/list" ) {
             $self->handle_list_tools($req);
         }
-        elsif ($method eq "tools/call") {
+        elsif ( $method eq "tools/call" ) {
             $self->handle_call_tool($req);
         }
-        elsif ($method eq "prompts/list") {
+        elsif ( $method eq "prompts/list" ) {
             $self->handle_list_prompts($req);
         }
-        elsif ($method eq "prompts/get") {
+        elsif ( $method eq "prompts/get" ) {
             $self->handle_get_prompt($req);
         }
-        elsif ($method eq "shutdown") {
+        elsif ( $method eq "shutdown" ) {
             $self->handle_shutdown($req);
         }
-        elsif ($method eq "exit") {
-            $logger->log("Received exit notification");
+        elsif ( $method eq "exit" ) {
+            main::INFO("Received exit notification");
             exit(0);
         }
         else {
-            $logger->log("Method not found: $method");
-            $self->send_error(-32601, "Method not found: $method", $req->{id});
+            main::ERROR("Method not found: $method");
+            $self->send_error( -32601, "Method not found: $method",
+                $req->{id} );
         }
     }
 
     method handle_initialize($request) {
-        $logger->log("Handling initialize request");
+        main::INFO("Handling initialize request");
 
         my $response = {
             jsonrpc => "2.0",
@@ -367,6 +368,7 @@ class MCPServer {
                 },
                 capabilities => {
                     tools => { listChanged => true }
+
                     # Removed prompts capability for troubleshooting
                 }
             }
@@ -385,7 +387,7 @@ class MCPServer {
     }
 
     method handle_list_tools($request) {
-        $logger->log("Handling tools/list request");
+        main::INFO("Handling tools/list request");
 
         my $response = {
             jsonrpc => "2.0",
@@ -436,12 +438,12 @@ class MCPServer {
     }
 
     method handle_call_tool($request) {
-        $logger->log("Handling tools/call request");
+        main::INFO("Handling tools/call request");
 
         my $tool_name = $request->{params}{name}      // '';
         my $tool_args = $request->{params}{arguments} // {};
 
-        $logger->log(
+        main::DEBUG(
             "Tool: $tool_name, Arguments: " . encode_json($tool_args) );
 
         if ( $tool_name eq "fetch" ) {
@@ -464,7 +466,7 @@ class MCPServer {
                 $self->send_message($response);
             }
             catch ($e) {
-                $logger->log("Error performing fetch: $e");
+                main::ERROR("Error performing fetch: $e");
 
                 my $response = {
                     jsonrpc => "2.0",
@@ -484,21 +486,22 @@ class MCPServer {
             }
         }
         else {
-            $logger->log("Tool not found: $tool_name");
+            main::ERROR("Tool not found: $tool_name");
             $self->send_error( -32601, "Tool not found: $tool_name",
                 $request->{id} );
         }
     }
 
     method handle_list_prompts($request) {
-        $logger->log("Handling prompts/list request");
+        main::INFO("Handling prompts/list request");
 
-        # Since we're not declaring prompts capability, we should still respond properly
+# Since we're not declaring prompts capability, we should still respond properly
         my $response = {
             jsonrpc => "2.0",
             id      => $request->{id},
             result  => {
-                prompts => []  # Empty array since we're disabling prompts temporarily
+                prompts =>
+                  []    # Empty array since we're disabling prompts temporarily
             }
         };
 
@@ -506,18 +509,16 @@ class MCPServer {
     }
 
     method handle_get_prompt($request) {
-        $logger->log("Handling prompts/get request");
+        main::INFO("Handling prompts/get request");
 
         # Since we're not supporting prompts right now, return an error
-        $self->send_error(
-            -32601,
+        $self->send_error( -32601,
             "Method not supported: prompts are temporarily disabled",
-            $request->{id}
-        );
+            $request->{id} );
     }
 
     method handle_shutdown($request) {
-        $logger->log("Received shutdown request");
+        main::INFO("Received shutdown request");
 
         # Handle shutdown request properly with empty result object
         my $response = {
@@ -535,13 +536,13 @@ class MCPServer {
     # Send a JSON-RPC message
     method send_message($message) {
         my $message_json = encode_json($message);
-        $logger->log("Sending message: $message_json");
+        main::DEBUG("Sending message: $message_json");
         say $message_json;
     }
 
     # Send a JSON-RPC error
-    method send_error($code, $message, $id) {
-        $logger->log("Sending error: $message (code: $code)");
+    method send_error( $code, $message, $id ) {
+        main::ERROR("Sending error: $message (code: $code)");
 
         # Ensure id is never null/undef
         $id = 0 unless defined $id;
@@ -574,25 +575,10 @@ class MCPServer {
 }
 
 # Create and run server
-my $logger = Logger->new();
-$logger->log("Initializing MCP Fetch server");
-
-my $config        = FetchConfig->new();
-my $fetch_service = FetchService->new(
-    config            => $config,
-    logger            => $logger,
-    ignore_robots_txt => $config->ignore_robots_txt
-);
-
-my $server = MCPServer->new(
-    config        => $config,
-    logger        => $logger,
-    fetch_service => $fetch_service
-);
+my $config = FetchConfig->new();
+my $server = MCPServer->new( config => $config );
 
 $server->run();
-
-$logger->log("Server stopped.");
 
 __END__
 

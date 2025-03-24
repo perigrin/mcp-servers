@@ -1,6 +1,10 @@
 #!/usr/bin/env perl
 use 5.38.0;
 use experimental qw(class try builtin);
+
+use FindBin;
+use local::lib "$FindBin::Bin/../local";
+
 use Mojolicious::Lite -signatures;
 use Mojo::JSON qw(encode_json decode_json);
 use Mojo::EventEmitter;
@@ -17,19 +21,8 @@ my $events             = Mojo::EventEmitter->new;
 my $heartbeat_interval = 5;                         # seconds
 my $debug              = $ENV{DEBUG} // 0;
 
-# Configure logging
+# Configure Mojolicious logging to use Log::Log4perl::Tiny
 app->log->level( $debug ? 'debug' : 'info' );
-
-# Set custom log format with timestamps
-app->log->format(
-    sub ( $time, $level, @lines ) {
-        return
-            "["
-          . localtime(time)
-          . "] [$$] [$level] "
-          . join( "\n", @lines ) . "\n";
-    }
-);
 
 # SSE endpoint - handles server-to-client communication
 get '/sse' => sub ($c) {

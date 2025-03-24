@@ -7,6 +7,7 @@ use local::lib "$FindBin::Bin/../local";
 use DBI;
 use DBD::SQLite;
 use IO::Handle;
+use Log::Log4perl::Tiny qw(:easy);
 
 $ENV{DB_PATH} //= "$FindBin::Bin/../commonplace.db";
 
@@ -19,32 +20,27 @@ my $PROTOCOL_VERSION = "2024-11-05";
 my $SERVER_NAME      = "commonplace";
 my $SERVER_VERSION   = "1.0.0";
 
-# MCP Server implementation for Commonplace knowledge base
-# This server implements the Model Context Protocol to provide
-# search capabilities for your personal knowledge base in Claude Desktop
-
-class Logger {
-    field $file :param = $ENV{LOG_FILE};
-    ADJUST {
-        if ($file) {
-            open STDERR, ">>", $file or die "Failed to open log file: $!";
-        }
+# Set format to include [MCP Server] prefix
+Log::Log4perl->easy_init(
+    {
+        layout => '[MCP Server] %m%n',
+        level  => $ENV{DEBUG} ? $DEBUG : $INFO,
+        ( $ENV{LOG_FILE} ? ( file => $ENV{LOG_FILE} ) : () )
     }
-
-    method log ($message) {
-        say STDERR "[MCP Server] $message";
-    }
-}
+);
 
 # Configuration class
-class Config {
-    field $dsn :param :reader         = $ENV{DB_URL} // $ENV{DATABASE_DSN} // 'dbi:SQLite:dbname=' . ($ENV{DB_PATH} // "$FindBin::Bin/../commonplace.db");
-    field $db_user :param :reader     = $ENV{DATABASE_USER} // '';
-    field $db_password :param :reader = $ENV{DATABASE_PASSWORD} // '';
-    field $embedding_dimensions :param :reader = $ENV{EMBEDDING_DIMENSIONS} // 1536;
+class CommonplaceConfig {
+    field $dsn :param :reader = $ENV{DB_URL} // $ENV{DATABASE_DSN}
+      // 'dbi:SQLite:dbname='
+      . ( $ENV{DB_PATH} // "$FindBin::Bin/../commonplace.db" );
+    field $db_user :param :reader              = $ENV{DATABASE_USER}     // '';
+    field $db_password :param :reader          = $ENV{DATABASE_PASSWORD} // '';
+    field $embedding_dimensions :param :reader = $ENV{EMBEDDING_DIMENSIONS}
+      // 1536;
     field $debug :param :reader       = 0;
     field $max_results :param :reader = 5;
-    
+
     # Detect database type
     method is_postgres {
         return $dsn =~ /^dbi:Pg:/i;
@@ -55,14 +51,14 @@ class Config {
 class Database {
     field $dbh;
     field $config :param;
-    field $logger = Logger->new();
     field $is_postgres;
 
     ADJUST {
         $is_postgres = $config->is_postgres;
-        $logger->log("Database type: " . ($is_postgres ? "PostgreSQL" : "SQLite"));
-        
-        $logger->log("Connecting to database: " . $config->dsn);
+        main::INFO(
+            "Database type: " . ( $is_postgres ? "PostgreSQL" : "SQLite" ) );
+
+        main::INFO( "Connecting to database: " . $config->dsn );
         $dbh = DBI->connect(
             $config->dsn,
             $config->db_user,
@@ -73,29 +69,32 @@ class Database {
                 AutoCommit => 1,
             }
         );
-        $logger->log("Database connection established");
-        
+        main::INFO("Database connection established");
+
         # Initialize database schema if needed
         $self->init_database();
     }
-    
+
     method init_database {
-        $logger->log("Initializing database schema");
-        
+        main::INFO("Initializing database schema");
+
         if ($is_postgres) {
+
             # PostgreSQL with pg_vector setup
-            
+
             # Create vector extension if it doesn't exist
             $dbh->do("CREATE EXTENSION IF NOT EXISTS vector");
-            
+
             # Check if documents table exists
             my $table_exists = $dbh->selectrow_array(
-                "SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = 'documents')"
+"SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = 'documents')"
             );
-            
+
             unless ($table_exists) {
+
                 # Create documents table
-                $dbh->do(q{
+                $dbh->do(
+                    q{
                     CREATE TABLE documents (
                         id SERIAL PRIMARY KEY,
                         title TEXT,
@@ -104,10 +103,12 @@ class Database {
                         created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
                         updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
                     )
-                });
-                
+                }
+                );
+
                 # Create embeddings table with vector type
-                $dbh->do(qq{
+                $dbh->do(
+                    qq{
                     CREATE TABLE embeddings (
                         id SERIAL PRIMARY KEY,
                         document_id INTEGER REFERENCES documents(id),
@@ -116,30 +117,38 @@ class Database {
                         embedding vector($config->embedding_dimensions),
                         created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
                     )
-                });
-                
+                }
+                );
+
                 # Create indexes
-                $dbh->do("CREATE INDEX idx_embeddings_document ON embeddings(document_id)");
-                
+                $dbh->do(
+"CREATE INDEX idx_embeddings_document ON embeddings(document_id)"
+                );
+
                 # Create vector similarity index
-                $dbh->do(qq{
-                    CREATE INDEX idx_embeddings_embedding ON embeddings 
+                $dbh->do(
+                    qq{
+                    CREATE INDEX idx_embeddings_embedding ON embeddings
                     USING hnsw (embedding vector_cosine_ops)
                     WITH (m = 16, ef_construction = 64)
-                });
+                }
+                );
             }
         }
-        # For SQLite, we assume the schema has already been created by the indexer
+
+      # For SQLite, we assume the schema has already been created by the indexer
     }
 
     method search ( $query, $limit = 5 ) {
-        $logger->log("Performing keyword search for: $query (limit: $limit)");
+        main::INFO("Performing keyword search for: $query (limit: $limit)");
 
         my $sth;
         if ($is_postgres) {
+
             # PostgreSQL full-text search implementation
-            $sth = $dbh->prepare(q{
-                SELECT 
+            $sth = $dbh->prepare(
+                q{
+                SELECT
                     d.id,
                     d.title,
                     d.path,
@@ -149,10 +158,12 @@ class Database {
                 WHERE to_tsvector('english', d.content || ' ' || COALESCE(d.title, '')) @@ plainto_tsquery($1)
                 ORDER BY ts_rank(to_tsvector('english', d.content || ' ' || COALESCE(d.title, '')), plainto_tsquery($1)) DESC
                 LIMIT $2
-            });
-            
-            $sth->execute($query, $limit);
-        } else {
+            }
+            );
+
+            $sth->execute( $query, $limit );
+        }
+        else {
             # Keyword-based search using SQLite FTS
             $sth = $dbh->prepare(
                 q{
@@ -167,27 +178,32 @@ class Database {
                 LIMIT ?
             }
             );
-            $sth->execute($query, $limit);
+            $sth->execute( $query, $limit );
         }
 
         my @results;
-        while (my $row = $sth->fetchrow_hashref) {
+        while ( my $row = $sth->fetchrow_hashref ) {
+
             # Truncate content if needed
             my $max_content = 1000;    # Maximum characters to include
-            if ($row->{content} && length($row->{content}) > $max_content) {
-                $row->{content} = substr($row->{content}, 0, $max_content) . "...";
+            if ( $row->{content} && length( $row->{content} ) > $max_content ) {
+                $row->{content} =
+                  substr( $row->{content}, 0, $max_content ) . "...";
             }
 
             push @results, $row;
         }
 
-        $logger->log("Search found " . scalar(@results) . " results using " . 
-                    ($is_postgres ? "PostgreSQL full-text search" : "SQLite FTS"));
+        main::INFO( "Search found "
+              . scalar(@results)
+              . " results using "
+              . ( $is_postgres ? "PostgreSQL full-text search" : "SQLite FTS" )
+        );
         return \@results;
     }
 
     method semantic_search ( $query, $limit = 5 ) {
-        $logger->log("Performing semantic search for: $query (limit: $limit)");
+        main::INFO("Performing semantic search for: $query (limit: $limit)");
 
         # We need to embed the query first
         # For now, we'll use a simplified approach by importing the
@@ -199,9 +215,9 @@ class Database {
         my $embedding_service = EmbeddingService->new( config => $config );
         my $query_embedding =
           $embedding_service->get_embedding_for_text( $query, 'query' );
-            
+
         unless ($query_embedding) {
-            $logger->log("Failed to generate embedding for query: $query", 'warning');
+            main::WARN("Failed to generate embedding for query: $query");
             return [];
         }
 
@@ -210,19 +226,21 @@ class Database {
     }
 
     method search_similar ( $query_embedding, $limit = 5 ) {
-        $logger->log("Finding similar documents");
+        main::INFO("Finding similar documents");
 
-        if ($is_postgres && $query_embedding) {
+        if ( $is_postgres && $query_embedding ) {
+
             # PostgreSQL with pg_vector native similarity search
-            
+
             # Convert binary embedding to PostgreSQL vector array format
-            my @vec_values = unpack("f*", $query_embedding);
-            my $vec_string = '[' . join(',', @vec_values) . ']';
-            
+            my @vec_values = unpack( "f*", $query_embedding );
+            my $vec_string = '[' . join( ',', @vec_values ) . ']';
+
             # Use the <=> operator (cosine distance) for semantic similarity
             # 1 - distance gives us similarity (0-1 range)
-            my $sth = $dbh->prepare(q{
-                SELECT 
+            my $sth = $dbh->prepare(
+                q{
+                SELECT
                     e.document_id,
                     e.chunk_index,
                     e.chunk_text,
@@ -235,19 +253,25 @@ class Database {
                 WHERE e.embedding IS NOT NULL
                 ORDER BY similarity DESC
                 LIMIT $2
-            });
-            
-            $sth->execute($vec_string, $limit);
-            
+            }
+            );
+
+            $sth->execute( $vec_string, $limit );
+
             my @results;
-            while (my $row = $sth->fetchrow_hashref) {
+            while ( my $row = $sth->fetchrow_hashref ) {
+
                 # Truncate content if needed
                 my $max_content = 1000;    # Maximum characters to include
-                if ($row->{content} && length($row->{content}) > $max_content) {
-                    $row->{content} = substr($row->{content}, 0, $max_content) . "...";
+                if ( $row->{content}
+                    && length( $row->{content} ) > $max_content )
+                {
+                    $row->{content} =
+                      substr( $row->{content}, 0, $max_content ) . "...";
                 }
-                
-                push @results, {
+
+                push @results,
+                  {
                     document_id => $row->{document_id},
                     chunk_index => $row->{chunk_index},
                     chunk_text  => $row->{chunk_text},
@@ -255,12 +279,15 @@ class Database {
                     path        => $row->{path},
                     content     => $row->{content},
                     similarity  => $row->{similarity}
-                };
+                  };
             }
-            
-            $logger->log("Found " . scalar(@results) . " similar documents using pg_vector");
+
+            main::INFO( "Found "
+                  . scalar(@results)
+                  . " similar documents using pg_vector" );
             return \@results;
-        } else {
+        }
+        else {
             # SQLite - in-memory similarity calculation
             # Fetch all embeddings
             my $sth = $dbh->prepare(
@@ -281,14 +308,18 @@ class Database {
             my @results;
             while ( my $row = $sth->fetchrow_hashref ) {
                 my $embedding = $row->{embedding};
-                next unless $embedding && $query_embedding; # Skip rows without embeddings
-                
+                next
+                  unless $embedding
+                  && $query_embedding;    # Skip rows without embeddings
+
                 my $similarity =
                   $self->cosine_similarity( $query_embedding, $embedding );
 
                 # Truncate content if needed
                 my $max_content = 1000;    # Maximum characters to include
-                if ( $row->{content} && length( $row->{content} ) > $max_content ) {
+                if ( $row->{content}
+                    && length( $row->{content} ) > $max_content )
+                {
                     $row->{content} =
                       substr( $row->{content}, 0, $max_content ) . "...";
                 }
@@ -313,13 +344,16 @@ class Database {
             my $final_results = [
                 @sorted_results[
                   0 .. (
-                      $limit - 1 < $#sorted_results ? $limit - 1 : $#sorted_results
+                        $limit - 1 < $#sorted_results
+                      ? $limit - 1
+                      : $#sorted_results
                   )
                 ]
             ];
 
-            $logger->log(
-                "Found " . scalar(@$final_results) . " similar documents using in-memory comparison" );
+            main::INFO( "Found "
+                  . scalar(@$final_results)
+                  . " similar documents using in-memory comparison" );
             return $final_results;
         }
     }
@@ -345,7 +379,7 @@ class Database {
     }
 
     method disconnect {
-        $logger->log("Disconnecting from database");
+        main::INFO("Disconnecting from database");
         $dbh->disconnect if $dbh;
     }
 }
@@ -355,12 +389,11 @@ class MCPServer {
     use builtin  qw(true);
     field $config :param;
     field $database = Database->new( config => $config );
-    field $logger   = Logger->new();
     field $buffer   = '';
 
     method run {
-        $logger->log("Starting Commonplace MCP server...");
-        $logger->log("Server ready. Waiting for input...");
+        main::INFO("Starting Commonplace MCP server...");
+        main::INFO("Server ready. Waiting for input...");
 
         # Simple line-by-line processing loop
         while ( my $line = <STDIN> ) {
@@ -369,7 +402,7 @@ class MCPServer {
         }
 
         # Clean up when done
-        $logger->log("Server shutting down...");
+        main::INFO("Server shutting down...");
         $database->disconnect();
     }
 
@@ -380,14 +413,14 @@ class MCPServer {
             my $line = $1;
             next unless $line =~ /\S/;    # Skip empty lines
 
-            $logger->log("Received message: $line");
+            main::INFO("Received message: $line");
 
             try {
                 my $message = decode_json($line);
                 $self->handle_message($message);
             }
             catch ($e) {
-                $logger->log("Parse error: $e");
+                main::ERROR("Parse error: $e");
                 $self->send_error( -32700, "Parse error", undef );
             }
         }
@@ -410,25 +443,25 @@ class MCPServer {
         elsif ( exists $message->{result} || exists $message->{error} ) {
 
             # Would handle responses here in a more complex implementation
-            $logger->log("Received response/error message (not handling)");
+            main::INFO("Received response/error message (not handling)");
         }
 
         # Invalid message
         else {
-            $logger->log("Invalid message format");
+            main::ERROR("Invalid message format");
             $self->send_error( -32600, "Invalid Request", $message->{id} );
         }
     }
 
     method handle_request ($request) {
         my $method = $request->{method};
-        $logger->log("Handling request method: $method");
+        main::INFO("Handling request method: $method");
 
         if ( $method eq "initialize" ) {
             $self->handle_initialize($request);
         }
         elsif ( $method eq "initialized" ) {
-            $logger->log("Received 'initialized' notification");
+            main::INFO("Received 'initialized' notification");
 
             # No response needed for notifications
         }
@@ -442,20 +475,20 @@ class MCPServer {
             $self->handle_shutdown($request);
         }
         elsif ( $method eq "exit" ) {
-            $logger->log("Received exit notification");
+            main::INFO("Received exit notification");
 
             # No response needed for notifications
             exit(0);
         }
         else {
-            $logger->log("Method not found: $method");
+            main::ERROR("Method not found: $method");
             $self->send_error( -32601, "Method not found: $method",
                 $request->{id} );
         }
     }
 
     method handle_initialize ($request) {
-        $logger->log("Handling initialize request");
+        main::INFO("Handling initialize request");
 
         my $response = {
             jsonrpc => "2.0",
@@ -485,7 +518,7 @@ class MCPServer {
     }
 
     method handle_list_tools ($request) {
-        $logger->log("Handling tools/list request");
+        main::INFO("Handling tools/list request");
 
         my $response = {
             jsonrpc => "2.0",
@@ -542,13 +575,12 @@ class MCPServer {
     }
 
     method handle_call_tool ($request) {
-        $logger->log("Handling tools/call request");
+        main::INFO("Handling tools/call request");
 
         my $tool_name = $request->{params}{name}      // '';
         my $tool_args = $request->{params}{arguments} // {};
 
-        $logger->log(
-            "Tool: $tool_name, Arguments: " . encode_json($tool_args) );
+        main::INFO( "Tool: $tool_name, Arguments: " . encode_json($tool_args) );
 
         if ( $tool_name eq "keyword_search" ) {
             my $query = $tool_args->{query} // '';
@@ -575,7 +607,7 @@ class MCPServer {
                 $self->send_message($response);
             }
             catch ($e) {
-                $logger->log("Error performing keyword search: $e");
+                main::ERROR("Error performing keyword search: $e");
 
                 my $response = {
                     jsonrpc => "2.0",
@@ -595,7 +627,7 @@ class MCPServer {
             }
         }
         elsif ( $tool_name eq "semantic_search" ) {
-            $logger->log("Running semantic_search");
+            main::INFO("Running semantic_search");
             my $query = $tool_args->{query} // '';
             my $limit = $tool_args->{limit} // $config->max_results;
 
@@ -620,7 +652,7 @@ class MCPServer {
                 $self->send_message($response);
             }
             catch ($e) {
-                $logger->log("Error performing semantic search: $e");
+                main::ERROR("Error performing semantic search: $e");
 
                 my $response = {
                     jsonrpc => "2.0",
@@ -640,14 +672,14 @@ class MCPServer {
             }
         }
         else {
-            $logger->log("Tool not found: $tool_name");
+            main::ERROR("Tool not found: $tool_name");
             $self->send_error( -32601, "Tool not found: $tool_name",
                 $request->{id} );
         }
     }
 
     method handle_shutdown ($request) {
-        $logger->log("Received shutdown request");
+        main::INFO("Received shutdown request");
 
         # Handle shutdown request properly with empty result object
         my $response = {
@@ -693,13 +725,13 @@ class MCPServer {
     # Send a JSON-RPC message
     method send_message ($message) {
         my $message_json = encode_json($message);
-        $logger->log("Sending message: $message_json");
+        main::DEBUG("Sending message: $message_json");
         say $message_json;
     }
 
     # Send a JSON-RPC error
     method send_error ( $code, $message, $id ) {
-        $logger->log("Sending error: $message (code: $code)");
+        main::ERROR("Sending error: $message (code: $code)");
 
         my $error = {
             jsonrpc => "2.0",
@@ -729,11 +761,9 @@ class MCPServer {
 }
 
 # Create and run server
-my $config = Config->new();
-
+my $config = CommonplaceConfig->new();
 my $server = MCPServer->new( config => $config );
 $server->run();
-say STDERR "Server stopped.";
 __END__
 
 =head1 NAME

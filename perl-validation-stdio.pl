@@ -8,6 +8,7 @@ use local::lib "$FindBin::Bin/../local";
 use Perl::Critic;
 use Perl::Tidy;
 use IO::Handle;
+use Log::Log4perl::Tiny qw(:easy);
 
 # Set stdout and stderr to be unbuffered
 STDOUT->autoflush(1);
@@ -18,19 +19,14 @@ my $PROTOCOL_VERSION = "2024-11-05";
 my $SERVER_NAME      = "perl-validation";
 my $SERVER_VERSION   = "1.0.0";
 
-class Logger {
-    field $file :param = $ENV{LOG_FILE};
-
-    ADJUST {
-        if ($file) {
-            open STDERR, ">>", $file or die "Failed to open log file: $!";
-        }
+# Set format to include [MCP Server] prefix
+Log::Log4perl->easy_init(
+    {
+        layout => '[MCP Server] %m%n',
+        level  => $ENV{DEBUG} ? $DEBUG : $INFO,
+        ( $ENV{LOG_FILE} ? ( file => $ENV{LOG_FILE} ) : () )
     }
-
-    method log($message) {
-        say STDERR "[MCP Server] $message";
-    }
-}
+);
 
 class Config {
     field $critic_severity :param :reader   = $ENV{CRITIC_SEVERITY} // 'gentle';
@@ -46,7 +42,7 @@ class MCPServer {
 
     field $config :param;
     field $critic;
-    field $logger = Logger->new();
+    field $logger = main::get_logger();
     field $buffer = '';
 
     ADJUST {
@@ -58,8 +54,8 @@ class MCPServer {
     }
 
     method run {
-        $logger->log("Starting Perl Validation MCP server (STDIO version)");
-        $logger->log("Server ready. Waiting for input...");
+        $logger->info("Starting Perl Validation MCP server (STDIO version)");
+        $logger->info("Server ready. Waiting for input...");
 
         # Process input stream
         while ( my $line = <STDIN> ) {
@@ -67,7 +63,7 @@ class MCPServer {
             $self->process_buffer();
         }
 
-        $logger->log("Server shutting down...");
+        $logger->info("Server shutting down...");
     }
 
     method process_buffer {
@@ -77,14 +73,14 @@ class MCPServer {
             my $line = $1;
             next unless $line =~ /\S/;    # Skip empty lines
 
-            $logger->log("Received message: $line");
+            $logger->info("Received message: $line");
 
             try {
                 my $message = decode_json($line);
                 $self->handle_message($message);
             }
             catch ($e) {
-                $logger->log("Parse error: $e");
+                $logger->info("Parse error: $e");
                 $self->send_error( -32700, "Parse error", undef );
             }
         }
@@ -105,19 +101,19 @@ class MCPServer {
 
         # We're not expecting responses in this simple server
         elsif ( exists $message->{result} || exists $message->{error} ) {
-            $logger->log("Received response/error message (not handling)");
+            $logger->info("Received response/error message (not handling)");
         }
 
         # Invalid message
         else {
-            $logger->log("Invalid message format");
+            $logger->error("Invalid message format");
             $self->send_error( -32600, "Invalid Request", $message->{id} );
         }
     }
 
     method handle_request($request) {
         my $method = $request->{method};
-        $logger->log("Handling request method: $method");
+        $logger->info("Handling request method: $method");
 
         if ( $method eq "initialize" ) {
             $self->handle_initialize($request);
@@ -138,18 +134,18 @@ class MCPServer {
             $self->handle_shutdown($request);
         }
         elsif ( $method eq "exit" ) {
-            $logger->log("Received exit notification");
+            $logger->info("Received exit notification");
             exit(0);
         }
         else {
-            $logger->log("Method not found: $method");
+            $logger->error("Method not found: $method");
             $self->send_error( -32601, "Method not found: $method",
                 $request->{id} );
         }
     }
 
     method handle_initialize($request) {
-        $logger->log("Handling initialize request");
+        $logger->info("Handling initialize request");
 
         my $response = {
             jsonrpc => "2.0",
@@ -180,7 +176,7 @@ class MCPServer {
     }
 
     method handle_list_tools($request) {
-        $logger->log("Handling tools/list request");
+        $logger->info("Handling tools/list request");
 
         my $response = {
             jsonrpc => "2.0",
@@ -270,12 +266,12 @@ class MCPServer {
     }
 
     method handle_call_tool($request) {
-        $logger->log("Handling tools/call request");
+        $logger->info("Handling tools/call request");
 
         my $tool_name = $request->{params}{name};
         my $args      = $request->{params}{arguments};
 
-        $logger->log( "Tool: $tool_name, Arguments: " . encode_json($args) );
+        $logger->debug( "Tool: $tool_name, Arguments: " . encode_json($args) );
 
         # Validate tool exists and code size
         if ( !$tool_name || !$args || !$args->{code} ) {
@@ -545,7 +541,7 @@ class MCPServer {
     }
 
     method handle_list_prompts($request) {
-        $logger->log("Handling prompts/list request");
+        $logger->info("Handling prompts/list request");
 
         my $response = {
             jsonrpc => "2.0",
@@ -613,12 +609,12 @@ class MCPServer {
     }
 
     method handle_get_prompt($request) {
-        $logger->log("Handling prompts/get request");
+        $logger->info("Handling prompts/get request");
 
         my $prompt_name = $request->{params}{name};
         my $args        = $request->{params}{arguments} // {};
 
-        $logger->log(
+        $logger->debug(
             "Prompt: $prompt_name, Arguments: " . encode_json($args) );
 
         if ( $prompt_name eq "perl_module_template" ) {
@@ -707,7 +703,7 @@ class MCPServer {
     }
 
     method handle_shutdown($request) {
-        $logger->log("Handling shutdown request");
+        $logger->info("Handling shutdown request");
 
         my $response = {
             jsonrpc => "2.0",
@@ -724,13 +720,13 @@ class MCPServer {
     # Send a JSON-RPC message
     method send_message($message) {
         my $message_json = encode_json($message);
-        $logger->log("Sending message: $message_json");
+        $logger->debug("Sending message: $message_json");
         say $message_json;
     }
 
     # Send a JSON-RPC error
     method send_error( $code, $message, $id ) {
-        $logger->log("Sending error: $message (code: $code)");
+        $logger->info("Sending error: $message (code: $code)");
 
         # Ensure id is never null to avoid issues with Claude Desktop
         my $error = {

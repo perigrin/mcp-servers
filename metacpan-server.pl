@@ -7,6 +7,7 @@ use FindBin;
 use local::lib "$FindBin::Bin/../local";
 use HTTP::Tiny;
 use IO::Handle;
+use Log::Log4perl::Tiny qw(:easy);
 
 # Set stdout and stderr to be unbuffered
 STDOUT->autoflush(1);
@@ -17,23 +18,17 @@ my $PROTOCOL_VERSION = "2024-11-05";
 my $SERVER_NAME      = "metacpan";
 my $SERVER_VERSION   = "1.0.0";
 
-# Logger class
-class Logger {
-    field $file :param;
-
-    ADJUST {
-        if ($file) {
-            open STDERR, ">>", $file or die "Failed to open log file: $!";
-        }
+# Set format to include [MCP Server] prefix
+Log::Log4perl->easy_init(
+    {
+        layout => '[MCP Server] %m%n',
+        level  => $ENV{DEBUG} ? $DEBUG : $INFO,
+        ( $ENV{LOG_FILE} ? ( file => $ENV{LOG_FILE} ) : () )
     }
-
-    method log ( $message, @ ) {
-        say STDERR "[MCP Server] $message";
-    }
-}
+);
 
 # Configuration class
-class Config {
+class MetacpanConfig {
     field $metacpan_api_url :param :reader = $ENV{METACPAN_API_URL}
       // 'https://fastapi.metacpan.org/v1';
     field $debug :param :reader       = $ENV{DEBUG}       // 0;
@@ -55,10 +50,10 @@ class CacheManager {
         if ( exists $cache{$key} ) {
             my $ttl = $timestamps{$key} + $config->cache_ttl;
             if ( $ttl > $now ) {
-                $logger->log( "Cache hit for key: $key", 'debug' );
+                $logger->debug("Cache hit for key: $key");
                 return $cache{$key};
             }
-            $logger->log( "Cache expired for key: $key", 'debug' );
+            $logger->debug("Cache expired for key: $key");
             delete $cache{$key};
             delete $timestamps{$key};
         }
@@ -68,7 +63,7 @@ class CacheManager {
     method set ( $key, $value, $ttl = undef ) {
         $cache{$key}      = $value;
         $timestamps{$key} = time();
-        $logger->log( "Set cache for key: $key", 'debug' );
+        $logger->debug("Set cache for key: $key");
         return $value;
     }
 
@@ -84,13 +79,13 @@ class CacheManager {
     method invalidate ($key) {
         delete $cache{$key};
         delete $timestamps{$key};
-        $logger->log( "Invalidated cache for key: $key", 'debug' );
+        $logger->debug("Invalidated cache for key: $key");
     }
 
     method clear {
         %cache      = ();
         %timestamps = ();
-        $logger->log( "Cleared entire cache", 'debug' );
+        $logger->debug("Cleared entire cache");
     }
 }
 
@@ -107,7 +102,7 @@ class MetaCPANClient {
     );
 
     method search_modules ( $query, $size = 10 ) {
-        $logger->log( "Searching for modules: $query (size: $size)", 'debug' );
+        $logger->debug("Searching for modules: $query (size: $size)");
 
         # Change to release endpoint which is better for author queries
         my $url = $config->metacpan_api_url . "/release/_search";
@@ -124,7 +119,7 @@ class MetaCPANClient {
     }
 
     method get_module ($module_name) {
-        $logger->log( "Getting module info: $module_name", 'debug' );
+        $logger->debug("Getting module info: $module_name");
 
         my $escaped_name = uri_escape_utf8($module_name);
         my $url          = $config->metacpan_api_url . "/module/$escaped_name";
@@ -134,9 +129,8 @@ class MetaCPANClient {
     }
 
     method get_documentation ( $module_name, $section = 'all' ) {
-        $logger->log(
-"Getting documentation for module: $module_name (section: $section)",
-            'debug'
+        $logger->debug(
+            "Getting documentation for module: $module_name (section: $section)"
         );
 
         my $escaped_name = uri_escape_utf8($module_name);
@@ -151,8 +145,7 @@ class MetaCPANClient {
     }
 
     method get_dependencies ($module_name) {
-        $logger->log( "Getting dependencies for module: $module_name",
-            'debug' );
+        $logger->debug("Getting dependencies for module: $module_name");
 
         # First get the distribution name from the module
         my $module_info = $self->get_module($module_name);
@@ -168,7 +161,7 @@ class MetaCPANClient {
     }
 
     method get_author ($author_id) {
-        $logger->log( "Getting author info: $author_id", 'debug' );
+        $logger->debug("Getting author info: $author_id");
 
         my $url = $config->metacpan_api_url . "/author/$author_id";
 
@@ -191,7 +184,7 @@ class MetaCPANClient {
         }
 
         my $full_url = $url . $query_string;
-        $logger->log( "Making request to: $full_url", 'debug' );
+        $logger->debug("Making request to: $full_url");
 
         my $headers = {
             'Accept'       => 'application/json',
@@ -205,14 +198,13 @@ class MetaCPANClient {
                 return decode_json( $response->{content} );
             }
             catch ($e) {
-                $logger->log( "Failed to decode JSON: $e", 'error' );
+                $logger->error("Failed to decode JSON: $e");
                 return { error => "Failed to decode response: $e" };
             }
         }
         else {
-            $logger->log(
-                "Request failed: $response->{status} $response->{reason}",
-                'error' );
+            $logger->error(
+                "Request failed: $response->{status} $response->{reason}");
             return {
                 error =>
                   "Request failed: $response->{status} $response->{reason}",
@@ -673,7 +665,7 @@ class MCPServer {
     use builtin  qw(true false);
 
     field $config :param;
-    field $logger     = Logger->new( file => $config->log_file, );
+    field $logger     = main::get_logger();
     field $api_client = MetaCPANClient->new(
         config => $config,
         logger => $logger
@@ -731,10 +723,10 @@ class MCPServer {
     }
 
     method run {
-        $logger->log(
+        $logger->info(
             "Starting MetaCPAN MCP server (version $SERVER_VERSION)...");
-        $logger->log( "Using MetaCPAN API at: " . $config->metacpan_api_url );
-        $logger->log("Server ready. Waiting for input...");
+        $logger->info( "Using MetaCPAN API at: " . $config->metacpan_api_url );
+        $logger->info("Server ready. Waiting for input...");
 
         # Simple line-by-line processing loop
         while ( my $line = <STDIN> ) {
@@ -743,7 +735,7 @@ class MCPServer {
         }
 
         # Clean up when done
-        $logger->log("Server shutting down...");
+        $logger->info("Server shutting down...");
     }
 
     method process_buffer {
@@ -753,14 +745,14 @@ class MCPServer {
             my $line = $1;
             next unless $line =~ /\S/;    # Skip empty lines
 
-            $logger->log( "Received message: $line", 'debug' );
+            $logger->debug("Received message: $line");
 
             try {
                 my $message = decode_json($line);
                 $self->handle_message($message);
             }
             catch ($e) {
-                $logger->log( "Parse error: $e", 'error' );
+                $logger->error("Parse error: $e");
                 $self->send_error( -32700, "Parse error", undef );
             }
         }
@@ -783,26 +775,25 @@ class MCPServer {
         elsif ( exists $message->{result} || exists $message->{error} ) {
 
             # Would handle responses here in a more complex implementation
-            $logger->log( "Received response/error message (not handling)",
-                'debug' );
+            $logger->debug("Received response/error message (not handling)");
         }
 
         # Invalid message
         else {
-            $logger->log( "Invalid message format", 'error' );
+            $logger->error("Invalid message format");
             $self->send_error( -32600, "Invalid Request", $message->{id} );
         }
     }
 
     method handle_request ($request) {
         my $method = $request->{method};
-        $logger->log("Handling request method: $method");
+        $logger->info("Handling request method: $method");
 
         if ( $method eq "initialize" ) {
             $self->handle_initialize($request);
         }
         elsif ( $method eq "initialized" ) {
-            $logger->log("Received 'initialized' notification");
+            $logger->info("Received 'initialized' notification");
 
             # No response needed for notifications
         }
@@ -816,20 +807,20 @@ class MCPServer {
             $self->handle_shutdown($request);
         }
         elsif ( $method eq "exit" ) {
-            $logger->log("Received exit notification");
+            $logger->info("Received exit notification");
 
             # No response needed for notifications
             exit(0);
         }
         else {
-            $logger->log( "Method not found: $method", 'error' );
+            $logger->error("Method not found: $method");
             $self->send_error( -32601, "Method not found: $method",
                 $request->{id} );
         }
     }
 
     method handle_initialize ($request) {
-        $logger->log("Handling initialize request");
+        $logger->info("Handling initialize request");
 
         my $response = {
             jsonrpc => "2.0",
@@ -859,7 +850,7 @@ class MCPServer {
     }
 
     method handle_list_tools ($request) {
-        $logger->log("Handling tools/list request");
+        $logger->info("Handling tools/list request");
 
         my $response = {
             jsonrpc => "2.0",
@@ -964,12 +955,13 @@ class MCPServer {
     }
 
     method handle_call_tool ($request) {
-        $logger->log("Handling tools/call request");
+        $logger->info("Handling tools/call request");
 
         my $tool_name = $request->{params}{name}      // '';
         my $tool_args = $request->{params}{arguments} // {};
 
-        $logger->log( "Tool: $tool_name, Arguments: " . encode_json($tool_args),
+        $logger->debug(
+            "Tool: $tool_name, Arguments: " . encode_json($tool_args),
             'debug' );
 
         my $result;
@@ -994,13 +986,13 @@ class MCPServer {
             else {
                 $is_error = true;
                 $result   = { content => "Tool not found: $tool_name" };
-                $logger->log( "Tool not found: $tool_name", 'error' );
+                $logger->error("Tool not found: $tool_name");
             }
         }
         catch ($e) {
             $is_error = true;
             $result   = { content => "Error executing tool: $e" };
-            $logger->log( "Error executing tool: $e", 'error' );
+            $logger->error("Error executing tool: $e");
         }
 
         # Check if we got an error result from the tool
@@ -1033,7 +1025,7 @@ class MCPServer {
     }
 
     method handle_shutdown ($request) {
-        $logger->log("Received shutdown request");
+        $logger->info("Received shutdown request");
 
         # Handle shutdown request properly with empty result object
         my $response = {
@@ -1051,13 +1043,13 @@ class MCPServer {
     # Send a JSON-RPC message
     method send_message ($message) {
         my $message_json = encode_json($message);
-        $logger->log( "Sending message: $message_json", 'debug' );
+        $logger->debug("Sending message: $message_json");
         say $message_json;
     }
 
     # Send a JSON-RPC error
     method send_error ( $code, $message, $id ) {
-        $logger->log( "Sending error: $message (code: $code)", 'error' );
+        $logger->error("Sending error: $message (code: $code)");
 
         my $error = {
             jsonrpc => "2.0",
@@ -1087,7 +1079,7 @@ class MCPServer {
 }
 
 # Create and run server
-my $config = Config->new();
+my $config = MetacpanConfig->new();
 my $server = MCPServer->new( config => $config );
 $server->run();
 

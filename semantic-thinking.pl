@@ -10,6 +10,7 @@ use DBD::SQLite;
 use HTTP::Tiny;
 use Data::UUID;
 use MIME::Base64;
+use Log::Log4perl::Tiny qw(:easy);
 
 # Constants
 our $PROTOCOL_VERSION = "2024-11-05";
@@ -20,71 +21,44 @@ our $SERVER_VERSION   = "1.0.0";
 STDOUT->autoflush(1);
 STDERR->autoflush(1);
 
-# Logger class for consistent logging
-class Logger {
-    field $file :param      = $ENV{LOG_FILE};
-    field $log_level :param = $ENV{LOG_LEVEL} // 'info';
-
-    # Log levels: debug, info, warning, error
-    field %LEVELS = (
-        'debug'   => 0,
-        'info'    => 1,
-        'warning' => 2,
-        'error'   => 3
-    );
-
-    ADJUST {
-        if ($file) {
-            open STDERR, ">>", $file or die "Failed to open log file: $!";
-        }
+# Set format to include [MCP Server] prefix
+Log::Log4perl->easy_init(
+    {
+        layout => '[MCP Server] %m%n',
+        level  => $ENV{DEBUG} ? $DEBUG : $INFO,
+        ( $ENV{LOG_FILE} ? ( file => $ENV{LOG_FILE} ) : () )
     }
-
-    method log( $message, $level = 'info' ) {
-        # Skip if log level is too verbose
-        return unless $self->should_log($level);
-
-        my $timestamp = $self->get_timestamp();
-        say STDERR "[$timestamp] [$level] [MCP Server] $message";
-    }
-
-    method should_log($level) {
-        return ( $LEVELS{$level} // 0 ) >= ( $LEVELS{$log_level} // 0 );
-    }
-
-    method get_timestamp {
-        my ( $sec, $min, $hour, $mday, $mon, $year ) = localtime(time);
-        return sprintf(
-            "%04d-%02d-%02d %02d:%02d:%02d",
-            $year + 1900,
-            $mon + 1, $mday, $hour, $min, $sec
-        );
-    }
-}
+);
 
 # Configuration class
 class SemanticThinkingConfig {
+
     # Database settings
-    field $dsn :param :reader = $ENV{DATABASE_DSN} // 'dbi:SQLite:dbname=semantic_thinking.db';
-    field $db_user :param :reader = $ENV{DATABASE_USER} // '';
+    field $dsn :param :reader = $ENV{DATABASE_DSN}
+      // 'dbi:SQLite:dbname=semantic_thinking.db';
+    field $db_user :param :reader     = $ENV{DATABASE_USER}     // '';
     field $db_password :param :reader = $ENV{DATABASE_PASSWORD} // '';
-    
+
     # Embedding settings
-    field $voyage_api_key :param :reader = $ENV{VOYAGE_API_KEY} // '';
+    field $voyage_api_key :param :reader  = $ENV{VOYAGE_API_KEY}  // '';
     field $embedding_model :param :reader = $ENV{EMBEDDING_MODEL} // 'voyage-3';
-    field $embedding_dimensions :param :reader = $ENV{EMBEDDING_DIMENSIONS} // 1536;  # Default for voyage-3
-    
+    field $embedding_dimensions :param :reader = $ENV{EMBEDDING_DIMENSIONS}
+      // 1536;    # Default for voyage-3
+
     # Logging settings
     field $log_level :param :reader = $ENV{LOG_LEVEL} // 'info';
-    field $log_file :param :reader = $ENV{LOG_FILE};
-    field $debug :param :reader = $ENV{DEBUG} ? 1 : 0;
-    
+    field $log_file :param :reader  = $ENV{LOG_FILE};
+    field $debug :param :reader     = $ENV{DEBUG} ? 1 : 0;
+
     # Query settings
-    field $similarity_threshold :param :reader = $ENV{SIMILARITY_THRESHOLD} // 0.7;
-    
+    field $similarity_threshold :param :reader = $ENV{SIMILARITY_THRESHOLD}
+      // 0.7;
+
     # Server settings
-    field $server_name :param :reader = $ENV{SERVER_NAME} // 'semantic-sequential-thinking';
+    field $server_name :param :reader = $ENV{SERVER_NAME}
+      // 'semantic-sequential-thinking';
     field $server_version :param :reader = $ENV{SERVER_VERSION} // '1.0.0';
-    
+
     # Detect database type
     method is_postgres {
         return $dsn =~ /^dbi:Pg:/i;
@@ -94,21 +68,11 @@ class SemanticThinkingConfig {
 # EmbeddingService for semantic analysis
 class EmbeddingService {
     field $config :param;
-    field $logger;
-    field $http;
-
-    ADJUST {
-        # Create a logger instance
-        $logger = Logger->new(
-            log_level => $config->log_level,
-            file      => $config->log_file
-        );
-
-        $http = HTTP::Tiny->new(
-            timeout => 30,
-            agent   => 'SemanticSequentialThinking/1.0'
-        );
-    }
+    field $logger = main::get_logger();
+    field $http   = HTTP::Tiny->new(
+        timeout => 30,
+        agent   => 'SemanticSequentialThinking/1.0'
+    );
 
     method get_embedding_for_text( $text, $input_type = 'document' ) {
         $logger->log(
@@ -116,16 +80,14 @@ class EmbeddingService {
             'debug' );
 
         unless ( $config->voyage_api_key ) {
-            $logger->log( "No Voyage API key configured, skipping embeddings",
-                'warning' );
+            $logger->warn("No Voyage API key configured, skipping embeddings");
             return undef;
         }
 
         # Truncate text if needed - Voyage limit is around 8192 tokens
         my $max_chars = 32000;    # Rough approximation
         if ( length($text) > $max_chars ) {
-            $logger->log( "Text too long, truncating to $max_chars chars",
-                'warning' );
+            $logger->warn("Text too long, truncating to $max_chars chars");
             $text = substr( $text, 0, $max_chars );
         }
 
@@ -154,20 +116,19 @@ class EmbeddingService {
             {
                 my $embedding = $data->{data}[0]{embedding};
 
-                # Pack embedding as binary data for SQLite
-                # For PostgreSQL, this will be unpacked and formatted as a vector
+               # Pack embedding as binary data for SQLite
+               # For PostgreSQL, this will be unpacked and formatted as a vector
                 return pack( "f*", @$embedding );
             }
         }
 
-        $logger->log( "Failed to get embedding: " . $response->{content},
-            'error' );
+        $logger->error( "Failed to get embedding: " . $response->{content} );
         return undef;
     }
 
     method get_embeddings_for_texts( $texts, $input_type = 'document' ) {
-        $logger->log( "Getting embeddings for " . scalar(@$texts) . " texts",
-            'debug' );
+        $logger->debug(
+            "Getting embeddings for " . scalar(@$texts) . " texts" );
 
         my @embeddings;
         foreach my $text (@$texts) {
@@ -242,66 +203,56 @@ class EmbeddingService {
 # ThoughtStore for storing and retrieving thoughts
 class ThoughtStore {
     field $config :param;
-    field $logger;
-    field $dbh;
-    field $embedding_service;
-    field $uuid_generator = Data::UUID->new();
-    field $is_postgres;
+    field $logger = main::get_logger();
+    field $dbh    = DBI->connect(
+        $config->dsn,
+        $config->db_user,
+        $config->db_password,
+        {
+            RaiseError => 1,
+            PrintError => 0,
+            AutoCommit => 1,
+        }
+    );
+    field $embedding_service = EmbeddingService->new( config => $config );
+    field $uuid_generator    = Data::UUID->new();
+    field $is_postgres       = $config->is_postgres;
 
     ADJUST {
-        # Create a logger instance
-        $logger = Logger->new(
-            log_level => $config->log_level,
-            file      => $config->log_file
-        );
-
-        $logger->log("Initializing ThoughtStore with database: " . $config->dsn);
-        
-        # Check if we're using PostgreSQL
-        $is_postgres = $config->is_postgres;
-        $logger->log("Database type: " . ($is_postgres ? "PostgreSQL" : "SQLite"));
-
-        $dbh = DBI->connect(
-            $config->dsn,
-            $config->db_user,
-            $config->db_password,
-            {
-                RaiseError => 1,
-                PrintError => 0,
-                AutoCommit => 1,
-            }
-        );
-
         $self->init_database();
-        $embedding_service = EmbeddingService->new(config => $config);
     }
 
     method init_database {
-        $logger->log("Initializing database schema");
-        
+        $logger->info("Initializing database schema");
+
         if ($is_postgres) {
+
             # PostgreSQL with pg_vector setup
-            
+
             # Create vector extension if it doesn't exist
             $dbh->do("CREATE EXTENSION IF NOT EXISTS vector");
-            
+
             # Create conversations table
-            $dbh->do(q{
+            $dbh->do(
+                q{
                 CREATE TABLE IF NOT EXISTS conversations (
                     id TEXT PRIMARY KEY,
                     created_at TIMESTAMP WITH TIME ZONE NOT NULL,
                     updated_at TIMESTAMP WITH TIME ZONE NOT NULL
                 )
-            });
-            
+            }
+            );
+
             # Check if thoughts table exists
             my $table_exists = $dbh->selectrow_array(
-                "SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = 'thoughts')"
+"SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = 'thoughts')"
             );
-            
+
             unless ($table_exists) {
+
                 # Create thoughts table with vector type for embeddings
-                $dbh->do(qq{
+                $dbh->do(
+                    qq{
                     CREATE TABLE thoughts (
                         id TEXT PRIMARY KEY,
                         conversation_id TEXT NOT NULL,
@@ -315,33 +266,45 @@ class ThoughtStore {
                         created_at TIMESTAMP WITH TIME ZONE NOT NULL,
                         FOREIGN KEY (conversation_id) REFERENCES conversations(id)
                     )
-                });
-                
+                }
+                );
+
                 # Create indexes
-                $dbh->do("CREATE INDEX idx_thoughts_conversation ON thoughts(conversation_id)");
-                $dbh->do("CREATE INDEX idx_thoughts_branch ON thoughts(branch_id)");
-                $dbh->do("CREATE INDEX idx_thoughts_thought_number ON thoughts(thought_number)");
-                
-                # Create vector similarity index
-                # Using an HNSW index which is generally faster than ivfflat for exact nearest neighbor searches
-                # with a reasonable number of results
-                $dbh->do(qq{
-                    CREATE INDEX idx_thoughts_embedding ON thoughts 
+                $dbh->do(
+"CREATE INDEX idx_thoughts_conversation ON thoughts(conversation_id)"
+                );
+                $dbh->do(
+                    "CREATE INDEX idx_thoughts_branch ON thoughts(branch_id)");
+                $dbh->do(
+"CREATE INDEX idx_thoughts_thought_number ON thoughts(thought_number)"
+                );
+
+# Create vector similarity index
+# Using an HNSW index which is generally faster than ivfflat for exact nearest neighbor searches
+# with a reasonable number of results
+                $dbh->do(
+                    qq{
+                    CREATE INDEX idx_thoughts_embedding ON thoughts
                     USING hnsw (embedding vector_cosine_ops)
                     WITH (m = 16, ef_construction = 64)
-                });
+                }
+                );
             }
-        } else {
+        }
+        else {
             # SQLite setup
-            $dbh->do(q{
+            $dbh->do(
+                q{
                 CREATE TABLE IF NOT EXISTS conversations (
                     id TEXT PRIMARY KEY,
                     created_at INTEGER NOT NULL,
                     updated_at INTEGER NOT NULL
                 )
-            });
-            
-            $dbh->do(q{
+            }
+            );
+
+            $dbh->do(
+                q{
                 CREATE TABLE IF NOT EXISTS thoughts (
                     id TEXT PRIMARY KEY,
                     conversation_id TEXT NOT NULL,
@@ -355,22 +318,29 @@ class ThoughtStore {
                     created_at INTEGER NOT NULL,
                     FOREIGN KEY (conversation_id) REFERENCES conversations(id)
                 )
-            });
-            
-            $dbh->do(q{
-                CREATE INDEX IF NOT EXISTS idx_thoughts_conversation 
+            }
+            );
+
+            $dbh->do(
+                q{
+                CREATE INDEX IF NOT EXISTS idx_thoughts_conversation
                 ON thoughts(conversation_id)
-            });
-            
-            $dbh->do(q{
-                CREATE INDEX IF NOT EXISTS idx_thoughts_branch 
+            }
+            );
+
+            $dbh->do(
+                q{
+                CREATE INDEX IF NOT EXISTS idx_thoughts_branch
                 ON thoughts(branch_id)
-            });
-            
-            $dbh->do(q{
-                CREATE INDEX IF NOT EXISTS idx_thoughts_thought_number 
+            }
+            );
+
+            $dbh->do(
+                q{
+                CREATE INDEX IF NOT EXISTS idx_thoughts_thought_number
                 ON thoughts(thought_number)
-            });
+            }
+            );
         }
     }
 
@@ -378,46 +348,49 @@ class ThoughtStore {
         my $id = $uuid_generator->create_str();
 
         if ($is_postgres) {
+
             # Use NOW() for PostgreSQL timestamps with timezone
             $dbh->do(
-                "INSERT INTO conversations (id, created_at, updated_at) VALUES (?, NOW(), NOW())",
+"INSERT INTO conversations (id, created_at, updated_at) VALUES (?, NOW(), NOW())",
                 undef, $id
             );
-        } else {
+        }
+        else {
             # Use Unix timestamps for SQLite
             my $now = time();
             $dbh->do(
-                "INSERT INTO conversations (id, created_at, updated_at) VALUES (?, ?, ?)",
+"INSERT INTO conversations (id, created_at, updated_at) VALUES (?, ?, ?)",
                 undef, $id, $now, $now
             );
         }
 
-        $logger->log("Created new conversation with ID: $id", 'debug');
+        $logger->debug("Created new conversation with ID: $id");
         return $id;
     }
 
-    method store_thought($conversation_id, $thought_data) {
+    method store_thought( $conversation_id, $thought_data ) {
         my $id  = $uuid_generator->create_str();
         my $now = time();
 
         # Get embedding for the thought
-        my $embedding = $embedding_service->get_embedding_for_text($thought_data->{thought}, 'document');
+        my $embedding =
+          $embedding_service->get_embedding_for_text( $thought_data->{thought},
+            'document' );
 
         # Update conversation timestamp
         if ($is_postgres) {
             $dbh->do(
                 "UPDATE conversations SET updated_at = NOW() WHERE id = ?",
-                undef, $conversation_id
-            );
-        } else {
-            $dbh->do(
-                "UPDATE conversations SET updated_at = ? WHERE id = ?",
-                undef, $now, $conversation_id
-            );
+                undef, $conversation_id );
+        }
+        else {
+            $dbh->do( "UPDATE conversations SET updated_at = ? WHERE id = ?",
+                undef, $now, $conversation_id );
         }
 
         # Insert the thought
         if ($is_postgres) {
+
             # Better handling for PostgreSQL with vector extension
             my $stmt = qq{
                 INSERT INTO thoughts (
@@ -425,30 +398,45 @@ class ThoughtStore {
                     branch_id, branch_from_thought, is_revision, revises_thought, created_at
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())
             };
-                
+
             if ($embedding) {
+
                 # Convert to PostgreSQL vector format
-                my @vec_values = unpack("f*", $embedding);
-                my $vec_string = '[' . join(',', @vec_values) . ']';
-                
+                my @vec_values = unpack( "f*", $embedding );
+                my $vec_string = '[' . join( ',', @vec_values ) . ']';
+
                 $dbh->do(
                     $stmt,
                     undef,
-                    $id, $conversation_id, $thought_data->{thoughtNumber}, $thought_data->{thought},
-                    $vec_string, $thought_data->{branchId}, $thought_data->{branchFromThought},
-                    $thought_data->{isRevision} ? 1 : 0, $thought_data->{revisesThought}
+                    $id,
+                    $conversation_id,
+                    $thought_data->{thoughtNumber},
+                    $thought_data->{thought},
+                    $vec_string,
+                    $thought_data->{branchId},
+                    $thought_data->{branchFromThought},
+                    $thought_data->{isRevision} ? 1 : 0,
+                    $thought_data->{revisesThought}
                 );
-            } else {
+            }
+            else {
                 # Handle null embedding case
                 $dbh->do(
                     $stmt,
                     undef,
-                    $id, $conversation_id, $thought_data->{thoughtNumber}, $thought_data->{thought},
-                    undef, $thought_data->{branchId}, $thought_data->{branchFromThought},
-                    $thought_data->{isRevision} ? 1 : 0, $thought_data->{revisesThought}
+                    $id,
+                    $conversation_id,
+                    $thought_data->{thoughtNumber},
+                    $thought_data->{thought},
+                    undef,
+                    $thought_data->{branchId},
+                    $thought_data->{branchFromThought},
+                    $thought_data->{isRevision} ? 1 : 0,
+                    $thought_data->{revisesThought}
                 );
             }
-        } else {
+        }
+        else {
             # SQLite case
             $dbh->do(
                 "INSERT INTO thoughts (
@@ -456,166 +444,172 @@ class ThoughtStore {
                     branch_id, branch_from_thought, is_revision, revises_thought, created_at
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 undef,
-                $id, $conversation_id, $thought_data->{thoughtNumber}, $thought_data->{thought},
-                $embedding, $thought_data->{branchId}, $thought_data->{branchFromThought},
-                $thought_data->{isRevision} ? 1 : 0, $thought_data->{revisesThought}, $now
+                $id, $conversation_id, $thought_data->{thoughtNumber},
+                $thought_data->{thought},
+                $embedding, $thought_data->{branchId},
+                $thought_data->{branchFromThought},
+                $thought_data->{isRevision} ? 1 : 0,
+                $thought_data->{revisesThought}, $now
             );
         }
 
-        $logger->log(
-            "Stored thought #$thought_data->{thoughtNumber} in conversation $conversation_id",
-            'debug'
+        $logger->debug(
+"Stored thought #$thought_data->{thoughtNumber} in conversation $conversation_id"
         );
-        
+
         return $id;
     }
 
-    method get_thought($conversation_id, $thought_number) {
+    method get_thought( $conversation_id, $thought_number ) {
         my $sth = $dbh->prepare(
-            "SELECT * FROM thoughts 
-             WHERE conversation_id = ? AND thought_number = ? 
+            "SELECT * FROM thoughts
+             WHERE conversation_id = ? AND thought_number = ?
              ORDER BY created_at DESC LIMIT 1"
         );
-        $sth->execute($conversation_id, $thought_number);
+        $sth->execute( $conversation_id, $thought_number );
 
         return $sth->fetchrow_hashref();
     }
 
     method get_all_thoughts($conversation_id) {
         my $sth = $dbh->prepare(
-            "SELECT * FROM thoughts 
-             WHERE conversation_id = ? 
+            "SELECT * FROM thoughts
+             WHERE conversation_id = ?
              ORDER BY thought_number ASC"
         );
         $sth->execute($conversation_id);
 
         my @thoughts;
-        while (my $row = $sth->fetchrow_hashref()) {
+        while ( my $row = $sth->fetchrow_hashref() ) {
             push @thoughts, $row;
         }
 
         return \@thoughts;
     }
 
-    method get_thought_branch($conversation_id, $branch_id) {
+    method get_thought_branch( $conversation_id, $branch_id ) {
         my $sth = $dbh->prepare(
-            "SELECT * FROM thoughts 
-             WHERE conversation_id = ? AND branch_id = ? 
+            "SELECT * FROM thoughts
+             WHERE conversation_id = ? AND branch_id = ?
              ORDER BY thought_number ASC"
         );
-        $sth->execute($conversation_id, $branch_id);
+        $sth->execute( $conversation_id, $branch_id );
 
         my @thoughts;
-        while (my $row = $sth->fetchrow_hashref()) {
+        while ( my $row = $sth->fetchrow_hashref() ) {
             push @thoughts, $row;
         }
 
         return \@thoughts;
     }
 
-    method get_similar_thoughts($conversation_id, $thought_text, $limit = 5) {
-        $logger->log(
-            "Finding similar thoughts for: " . substr($thought_text, 0, 50) . "...",
-            'debug'
-        );
+    method get_similar_thoughts( $conversation_id, $thought_text, $limit = 5 ) {
+        $logger->debug( "Finding similar thoughts for: "
+              . substr( $thought_text, 0, 50 )
+              . "..." );
 
         # Get embedding for the current thought
-        my $current_embedding = 
-            $embedding_service->get_embedding_for_text($thought_text, 'document');
-        
+        my $current_embedding =
+          $embedding_service->get_embedding_for_text( $thought_text,
+            'document' );
+
         # Return empty array if we couldn't generate an embedding
         return [] unless $current_embedding;
-        
+
         if ($is_postgres) {
+
             # PostgreSQL with pg_vector native similarity search
-            
+
             # Convert binary embedding to PostgreSQL vector array format
-            my @vec_values = unpack("f*", $current_embedding);
-            my $vec_string = '[' . join(',', @vec_values) . ']';
-            
+            my @vec_values = unpack( "f*", $current_embedding );
+            my $vec_string = '[' . join( ',', @vec_values ) . ']';
+
             # Use the <=> operator (cosine distance) for semantic similarity
             # 1 - distance gives us similarity (0-1 range)
             my $threshold = $config->similarity_threshold;
-            
-            my $sth = $dbh->prepare(q{
-                SELECT 
+
+            my $sth = $dbh->prepare(
+                q{
+                SELECT
                     id,
-                    thought_number, 
-                    thought, 
+                    thought_number,
+                    thought,
                     1 - (embedding <=> $1::vector) AS similarity,
                     branch_id,
                     is_revision,
                     revises_thought
                 FROM thoughts
-                WHERE 
+                WHERE
                     conversation_id = $2
                     AND embedding IS NOT NULL
                     AND 1 - (embedding <=> $1::vector) >= $3
                 ORDER BY similarity DESC
                 LIMIT $4
-            });
-            
+            }
+            );
+
             # Using bind parameters with PostgreSQL positional syntax
-            $sth->execute($vec_string, $conversation_id, $threshold, $limit);
-            
+            $sth->execute( $vec_string, $conversation_id, $threshold, $limit );
+
             my @similar_thoughts;
-            while (my $row = $sth->fetchrow_hashref()) {
+            while ( my $row = $sth->fetchrow_hashref() ) {
                 push @similar_thoughts, $row;
             }
-            
-            $logger->log(
-                "Found " . scalar(@similar_thoughts) . " similar thoughts using pg_vector",
-                'debug'
-            );
-            
+
+            $logger->debug( "Found "
+                  . scalar(@similar_thoughts)
+                  . " similar thoughts using pg_vector", );
+
             return \@similar_thoughts;
-        } else {
+        }
+        else {
             # SQLite - in-memory similarity calculation
-            
+
             # Get all thoughts for the conversation
             my $sth = $dbh->prepare(
-                "SELECT * FROM thoughts WHERE conversation_id = ? ORDER BY thought_number ASC"
+"SELECT * FROM thoughts WHERE conversation_id = ? ORDER BY thought_number ASC"
             );
             $sth->execute($conversation_id);
-            
+
             my @all_thoughts;
-            while (my $row = $sth->fetchrow_hashref()) {
+            while ( my $row = $sth->fetchrow_hashref() ) {
                 push @all_thoughts, $row;
             }
-            
+
             # Calculate similarity scores
             my @scored_thoughts;
             foreach my $thought (@all_thoughts) {
                 next unless $thought->{embedding};
-                my $similarity = $embedding_service->cosine_similarity(
-                    $current_embedding, $thought->{embedding}
-                );
-                
+                my $similarity =
+                  $embedding_service->cosine_similarity( $current_embedding,
+                    $thought->{embedding} );
+
                 # Only include thoughts above the threshold
                 next unless $similarity >= $config->similarity_threshold;
-                
-                push @scored_thoughts, {
-                    id => $thought->{id},
-                    thought_number => $thought->{thought_number},
-                    thought => $thought->{thought},
-                    similarity => $similarity,
-                    branch_id => $thought->{branch_id},
-                    is_revision => $thought->{is_revision},
+
+                push @scored_thoughts,
+                  {
+                    id              => $thought->{id},
+                    thought_number  => $thought->{thought_number},
+                    thought         => $thought->{thought},
+                    similarity      => $similarity,
+                    branch_id       => $thought->{branch_id},
+                    is_revision     => $thought->{is_revision},
                     revises_thought => $thought->{revises_thought}
-                };
+                  };
             }
-            
+
             # Sort by similarity (highest first)
-            my @sorted_thoughts = sort { $b->{similarity} <=> $a->{similarity} } @scored_thoughts;
-            
+            my @sorted_thoughts =
+              sort { $b->{similarity} <=> $a->{similarity} } @scored_thoughts;
+
             # Take only the top results
-            my @limited_thoughts = splice(@sorted_thoughts, 0, $limit);
-            
-            $logger->log(
-                "Found " . scalar(@limited_thoughts) . " similar thoughts using in-memory comparison",
-                'debug'
-            );
-            
+            my @limited_thoughts = splice( @sorted_thoughts, 0, $limit );
+
+            $logger->debug( "Found "
+                  . scalar(@limited_thoughts)
+                  . " similar thoughts using in-memory comparison" );
+
             return \@limited_thoughts;
         }
     }
@@ -628,19 +622,9 @@ class ThoughtStore {
 # SequentialThinkingTool - Implements the core sequential thinking capability
 class SequentialThinkingTool {
     field $config :param;
-    field $logger;
-    field $thought_store;
+    field $logger        = main::get_logger();
+    field $thought_store = ThoughtStore->new( config => $config );
     field %active_conversations;
-
-    ADJUST {
-        # Create a logger instance
-        $logger = Logger->new(
-            log_level => $config->log_level,
-            file      => $config->log_file
-        );
-
-        $thought_store = ThoughtStore->new(config => $config);
-    }
 
     method handle_request($request) {
         $logger->log("Handling sequential thinking request");
@@ -648,34 +632,38 @@ class SequentialThinkingTool {
         my $args = $request->{params}{arguments};
 
         # Validate arguments
-        unless ($args
+        unless ( $args
             && $args->{thought}
             && $args->{thoughtNumber}
-            && $args->{totalThoughts})
+            && $args->{totalThoughts} )
         {
             return {
                 isError => JSON::PP::true,
-                content => [{
-                    type => "text",
-                    text => "Invalid arguments. Required: thought, thoughtNumber, totalThoughts."
-                }]
+                content => [
+                    {
+                        type => "text",
+                        text =>
+"Invalid arguments. Required: thought, thoughtNumber, totalThoughts."
+                    }
+                ]
             };
         }
 
         # Get or create conversation ID
-        my $conversation_id = $active_conversations{$request->{id}} 
-                            // $thought_store->create_conversation();
-        $active_conversations{$request->{id}} = $conversation_id;
+        my $conversation_id = $active_conversations{ $request->{id} }
+          // $thought_store->create_conversation();
+        $active_conversations{ $request->{id} } = $conversation_id;
 
         # Store the current thought
-        my $thought_id = $thought_store->store_thought($conversation_id, $args);
+        my $thought_id =
+          $thought_store->store_thought( $conversation_id, $args );
 
         # Find similar previous thoughts if this isn't the first thought
         my $similar_thoughts = [];
-        if ($args->{thoughtNumber} > 1) {
-            $similar_thoughts = $thought_store->get_similar_thoughts(
-                $conversation_id, $args->{thought}
-            );
+        if ( $args->{thoughtNumber} > 1 ) {
+            $similar_thoughts =
+              $thought_store->get_similar_thoughts( $conversation_id,
+                $args->{thought} );
         }
 
         # Prepare the response
@@ -695,10 +683,12 @@ class SequentialThinkingTool {
         }
 
         return {
-            content => [{
-                type => "text",
-                text => $result
-            }]
+            content => [
+                {
+                    type => "text",
+                    text => $result
+                }
+            ]
         };
     }
 }
@@ -707,107 +697,105 @@ class SequentialThinkingTool {
 class MCPServer {
     use JSON::PP qw(decode_json encode_json);
     field $config :param;
-    field $logger;
+    field $logger = main::get_logger();
     field $buffer = '';
-    field $sequential_thinking_tool;
-
-    ADJUST {
-        # Create a logger instance
-        $logger = Logger->new(
-            log_level => $config->log_level,
-            file      => $config->log_file
-        );
-
-        $sequential_thinking_tool = SequentialThinkingTool->new(config => $config);
-    }
+    field $sequential_thinking_tool =
+      SequentialThinkingTool->new( config => $config );
 
     method run {
-        $logger->log("Starting Semantic Sequential Thinking MCP server...");
-        $logger->log("Server ready. Waiting for input...");
+        $logger->info("Starting Semantic Sequential Thinking MCP server...");
+        $logger->info("Server ready. Waiting for input...");
 
         # Simple line-by-line processing loop
-        while (my $line = <STDIN>) {
+        while ( my $line = <STDIN> ) {
             $buffer .= $line;
             $self->process_buffer();
         }
 
-        $logger->log("Server shutting down...");
+        $logger->info("Server shutting down...");
     }
 
     method process_buffer {
-        # Process line-by-line (each message is on a separate line)
-        while ($buffer =~ s/^(.*)\n//) {
-            my $line = $1;
-            next unless $line =~ /\S/;  # Skip empty lines
 
-            $logger->log("Received message: $line", 'debug');
+        # Process line-by-line (each message is on a separate line)
+        while ( $buffer =~ s/^(.*)\n// ) {
+            my $line = $1;
+            next unless $line =~ /\S/;    # Skip empty lines
+
+            $logger->debug("Received message: $line");
 
             try {
                 my $message = decode_json($line);
                 $self->handle_message($message);
             }
             catch ($e) {
-                $logger->log("Parse error: $e", 'error');
-                $self->send_error(-32700, "Parse error", undef);
+                $logger->error("Parse error: $e");
+                $self->send_error( -32700, "Parse error", undef );
             }
         }
     }
 
     method handle_message($message) {
+
         # Validate JSON-RPC version
-        if (!exists $message->{jsonrpc} || $message->{jsonrpc} ne "2.0") {
-            $self->send_error(-32600, "Invalid Request", $message->{id});
+        if ( !exists $message->{jsonrpc} || $message->{jsonrpc} ne "2.0" ) {
+            $self->send_error( -32600, "Invalid Request", $message->{id} );
             return;
         }
 
         # Handle request
-        if (exists $message->{method}) {
+        if ( exists $message->{method} ) {
             $self->handle_request($message);
         }
+
         # Handle response (not expected in this server)
-        elsif (exists $message->{result} || exists $message->{error}) {
-            $logger->log("Received response/error message (not handling)", 'debug');
+        elsif ( exists $message->{result} || exists $message->{error} ) {
+            $logger->debug("Received response/error message (not handling)");
         }
+
         # Invalid message
         else {
-            $logger->log("Invalid message format", 'warning');
-            $self->send_error(-32600, "Invalid Request", $message->{id});
+            $logger->warn("Invalid message format");
+            $self->send_error( -32600, "Invalid Request", $message->{id} );
         }
     }
 
     method handle_request($request) {
         my $method = $request->{method};
-        $logger->log("Handling request method: $method");
+        $logger->info("Handling request method: $method");
 
-        if ($method eq "initialize") {
+        if ( $method eq "initialize" ) {
             $self->handle_initialize($request);
         }
-        elsif ($method eq "initialized") {
-            $logger->log("Received 'initialized' notification");
+        elsif ( $method eq "initialized" ) {
+            $logger->info("Received 'initialized' notification");
+
             # No response needed for notifications
         }
-        elsif ($method eq "tools/list") {
+        elsif ( $method eq "tools/list" ) {
             $self->handle_list_tools($request);
         }
-        elsif ($method eq "tools/call") {
+        elsif ( $method eq "tools/call" ) {
             $self->handle_call_tool($request);
         }
-        elsif ($method eq "shutdown") {
+        elsif ( $method eq "shutdown" ) {
             $self->handle_shutdown($request);
         }
-        elsif ($method eq "exit") {
-            $logger->log("Received exit notification");
+        elsif ( $method eq "exit" ) {
+            $logger->info("Received exit notification");
+
             # No response needed for notifications
             exit(0);
         }
         else {
-            $logger->log("Method not found: $method", 'warning');
-            $self->send_error(-32601, "Method not found: $method", $request->{id});
+            $logger->warn("Method not found: $method");
+            $self->send_error( -32601, "Method not found: $method",
+                $request->{id} );
         }
     }
 
     method handle_initialize($request) {
-        $logger->log("Handling initialize request");
+        $logger->info("Handling initialize request");
 
         my $response = {
             jsonrpc => "2.0",
@@ -837,7 +825,7 @@ class MCPServer {
     }
 
     method handle_list_tools($request) {
-        $logger->log("Handling tools/list request");
+        $logger->info("Handling tools/list request");
 
         my $response = {
             jsonrpc => "2.0",
@@ -846,11 +834,12 @@ class MCPServer {
                 tools => [
                     {
                         name        => "sequentialthinking",
-                        description => "A detailed tool for dynamic and reflective problem-solving through thoughts. This tool helps analyze problems through a flexible thinking process that can adapt and evolve. Each thought can build on, question, or revise previous insights as understanding deepens.",
+                        description =>
+"A detailed tool for dynamic and reflective problem-solving through thoughts. This tool helps analyze problems through a flexible thinking process that can adapt and evolve. Each thought can build on, question, or revise previous insights as understanding deepens.",
                         inputSchema => {
                             type     => "object",
                             required => [
-                                "thought", "nextThoughtNeeded",
+                                "thought",       "nextThoughtNeeded",
                                 "thoughtNumber", "totalThoughts"
                             ],
                             properties => {
@@ -860,7 +849,8 @@ class MCPServer {
                                 },
                                 nextThoughtNeeded => {
                                     type        => "boolean",
-                                    description => "Whether another thought step is needed"
+                                    description =>
+                                      "Whether another thought step is needed"
                                 },
                                 thoughtNumber => {
                                     type        => "integer",
@@ -869,21 +859,25 @@ class MCPServer {
                                 },
                                 totalThoughts => {
                                     type        => "integer",
-                                    description => "Estimated total thoughts needed",
+                                    description =>
+                                      "Estimated total thoughts needed",
                                     minimum => 1
                                 },
                                 isRevision => {
                                     type        => "boolean",
-                                    description => "Whether this revises previous thinking"
+                                    description =>
+                                      "Whether this revises previous thinking"
                                 },
                                 revisesThought => {
                                     type        => "integer",
-                                    description => "Which thought is being reconsidered",
+                                    description =>
+                                      "Which thought is being reconsidered",
                                     minimum => 1
                                 },
                                 branchFromThought => {
                                     type        => "integer",
-                                    description => "Branching point thought number",
+                                    description =>
+                                      "Branching point thought number",
                                     minimum => 1
                                 },
                                 branchId => {
@@ -905,16 +899,17 @@ class MCPServer {
     }
 
     method handle_call_tool($request) {
-        $logger->log("Handling tools/call request");
+        $logger->info("Handling tools/call request");
 
-        my $tool_name = $request->{params}{name} // '';
+        my $tool_name = $request->{params}{name}      // '';
         my $tool_args = $request->{params}{arguments} // {};
 
-        $logger->log("Tool: $tool_name", 'debug');
+        $logger->debug("Tool: $tool_name");
 
-        if ($tool_name eq "sequentialthinking") {
+        if ( $tool_name eq "sequentialthinking" ) {
             try {
-                my $result = $sequential_thinking_tool->handle_request($request);
+                my $result =
+                  $sequential_thinking_tool->handle_request($request);
 
                 my $response = {
                     jsonrpc => "2.0",
@@ -925,7 +920,8 @@ class MCPServer {
                 $self->send_message($response);
             }
             catch ($e) {
-                $logger->log("Error handling sequential thinking request: $e", 'error');
+                $logger->error(
+                    "Error handling sequential thinking request: $e");
 
                 my $response = {
                     jsonrpc => "2.0",
@@ -935,7 +931,8 @@ class MCPServer {
                         content => [
                             {
                                 type => "text",
-                                text => "Error processing sequential thinking request: $e"
+                                text =>
+"Error processing sequential thinking request: $e"
                             }
                         ]
                     }
@@ -945,13 +942,14 @@ class MCPServer {
             }
         }
         else {
-            $logger->log("Tool not found: $tool_name", 'warning');
-            $self->send_error(-32601, "Tool not found: $tool_name", $request->{id});
+            $logger->warn("Tool not found: $tool_name");
+            $self->send_error( -32601, "Tool not found: $tool_name",
+                $request->{id} );
         }
     }
 
     method handle_shutdown($request) {
-        $logger->log("Received shutdown request");
+        $logger->info("Received shutdown request");
 
         # Handle shutdown request properly with empty result object
         my $response = {
@@ -969,17 +967,17 @@ class MCPServer {
     # Send a JSON-RPC message
     method send_message($message) {
         my $message_json = encode_json($message);
-        $logger->log("Sending message: $message_json", 'debug');
+        $logger->debug("Sending message: $message_json");
         say $message_json;
     }
 
     # Send a JSON-RPC error
-    method send_error($code, $message, $id) {
-        $logger->log("Sending error: $message (code: $code)", 'warning');
+    method send_error( $code, $message, $id ) {
+        $logger->warn("Sending error: $message (code: $code)");
 
         my $error = {
             jsonrpc => "2.0",
-            id      => 0 + $id,  # Ensure ID is not null
+            id      => 0 + $id,    # Ensure ID is not null
             error   => {
                 code    => $code,
                 message => $message
@@ -990,12 +988,12 @@ class MCPServer {
     }
 
     # Send a logging notification to the client
-    method send_log_notification($level, $message) {
+    method send_log_notification( $level, $message ) {
         my $notification = {
             jsonrpc => "2.0",
             method  => "notifications/logging/message",
             params  => {
-                level => $level,  # "debug", "info", "warning", "error"
+                level => $level,    # "debug", "info", "warning", "error"
                 data  => $message
             }
         };
@@ -1006,7 +1004,7 @@ class MCPServer {
 
 # Create and run server
 my $config = SemanticThinkingConfig->new();
-my $server = MCPServer->new(config => $config);
+my $server = MCPServer->new( config => $config );
 $server->run();
 
 __END__
