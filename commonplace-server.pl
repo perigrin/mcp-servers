@@ -38,9 +38,17 @@ class Logger {
 
 # Configuration class
 class Config {
-    field $db_path :param :reader     = $ENV{DB_PATH};
+    field $dsn :param :reader         = $ENV{DB_URL} // $ENV{DATABASE_DSN} // 'dbi:SQLite:dbname=' . ($ENV{DB_PATH} // "$FindBin::Bin/../commonplace.db");
+    field $db_user :param :reader     = $ENV{DATABASE_USER} // '';
+    field $db_password :param :reader = $ENV{DATABASE_PASSWORD} // '';
+    field $embedding_dimensions :param :reader = $ENV{EMBEDDING_DIMENSIONS} // 1536;
     field $debug :param :reader       = 0;
     field $max_results :param :reader = 5;
+    
+    # Detect database type
+    method is_postgres {
+        return $dsn =~ /^dbi:Pg:/i;
+    }
 }
 
 # Database class (adapted from indexer.pl)
@@ -48,18 +56,17 @@ class Database {
     field $dbh;
     field $config :param;
     field $logger = Logger->new();
+    field $is_postgres;
 
     ADJUST {
-        my $db_path = $config->db_path;
-
-        unless ( -e $db_path ) {
-            die "Database file not found: $db_path";
-        }
-
-        $logger->log("Connecting to database: $db_path");
+        $is_postgres = $config->is_postgres;
+        $logger->log("Database type: " . ($is_postgres ? "PostgreSQL" : "SQLite"));
+        
+        $logger->log("Connecting to database: " . $config->dsn);
         $dbh = DBI->connect(
-            "dbi:SQLite:dbname=$db_path",
-            "", "",
+            $config->dsn,
+            $config->db_user,
+            $config->db_password,
             {
                 RaiseError => 1,
                 PrintError => 0,
@@ -67,41 +74,115 @@ class Database {
             }
         );
         $logger->log("Database connection established");
+        
+        # Initialize database schema if needed
+        $self->init_database();
+    }
+    
+    method init_database {
+        $logger->log("Initializing database schema");
+        
+        if ($is_postgres) {
+            # PostgreSQL with pg_vector setup
+            
+            # Create vector extension if it doesn't exist
+            $dbh->do("CREATE EXTENSION IF NOT EXISTS vector");
+            
+            # Check if documents table exists
+            my $table_exists = $dbh->selectrow_array(
+                "SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = 'documents')"
+            );
+            
+            unless ($table_exists) {
+                # Create documents table
+                $dbh->do(q{
+                    CREATE TABLE documents (
+                        id SERIAL PRIMARY KEY,
+                        title TEXT,
+                        path TEXT,
+                        content TEXT,
+                        created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+                        updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+                    )
+                });
+                
+                # Create embeddings table with vector type
+                $dbh->do(qq{
+                    CREATE TABLE embeddings (
+                        id SERIAL PRIMARY KEY,
+                        document_id INTEGER REFERENCES documents(id),
+                        chunk_index INTEGER,
+                        chunk_text TEXT,
+                        embedding vector($config->embedding_dimensions),
+                        created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+                    )
+                });
+                
+                # Create indexes
+                $dbh->do("CREATE INDEX idx_embeddings_document ON embeddings(document_id)");
+                
+                # Create vector similarity index
+                $dbh->do(qq{
+                    CREATE INDEX idx_embeddings_embedding ON embeddings 
+                    USING hnsw (embedding vector_cosine_ops)
+                    WITH (m = 16, ef_construction = 64)
+                });
+            }
+        }
+        # For SQLite, we assume the schema has already been created by the indexer
     }
 
     method search ( $query, $limit = 5 ) {
         $logger->log("Performing keyword search for: $query (limit: $limit)");
 
-        # Keyword-based search using FTS
-        my $sth = $dbh->prepare(
-            q{
-            SELECT id,
-                   title,
-                   path,
-                   snippet(documents_fts, 1, '<b>', '</b>', '...', 15) as snippet,
-                   content
-            FROM documents_fts
-            WHERE documents_fts MATCH ?
-            ORDER BY rank
-            LIMIT ?
+        my $sth;
+        if ($is_postgres) {
+            # PostgreSQL full-text search implementation
+            $sth = $dbh->prepare(q{
+                SELECT 
+                    d.id,
+                    d.title,
+                    d.path,
+                    d.content,
+                    ts_headline(d.content, plainto_tsquery($1), 'MaxWords=30, MinWords=15, StartSel=<b>, StopSel=</b>') as snippet
+                FROM documents d
+                WHERE to_tsvector('english', d.content || ' ' || COALESCE(d.title, '')) @@ plainto_tsquery($1)
+                ORDER BY ts_rank(to_tsvector('english', d.content || ' ' || COALESCE(d.title, '')), plainto_tsquery($1)) DESC
+                LIMIT $2
+            });
+            
+            $sth->execute($query, $limit);
+        } else {
+            # Keyword-based search using SQLite FTS
+            $sth = $dbh->prepare(
+                q{
+                SELECT id,
+                       title,
+                       path,
+                       snippet(documents_fts, 1, '<b>', '</b>', '...', 15) as snippet,
+                       content
+                FROM documents_fts
+                WHERE documents_fts MATCH ?
+                ORDER BY rank
+                LIMIT ?
+            }
+            );
+            $sth->execute($query, $limit);
         }
-        );
-        $sth->execute( $query, $limit );
 
         my @results;
-        while ( my $row = $sth->fetchrow_hashref ) {
-
+        while (my $row = $sth->fetchrow_hashref) {
             # Truncate content if needed
             my $max_content = 1000;    # Maximum characters to include
-            if ( length( $row->{content} ) > $max_content ) {
-                $row->{content} =
-                  substr( $row->{content}, 0, $max_content ) . "...";
+            if ($row->{content} && length($row->{content}) > $max_content) {
+                $row->{content} = substr($row->{content}, 0, $max_content) . "...";
             }
 
             push @results, $row;
         }
 
-        $logger->log( "Search found " . scalar(@results) . " results" );
+        $logger->log("Search found " . scalar(@results) . " results using " . 
+                    ($is_postgres ? "PostgreSQL full-text search" : "SQLite FTS"));
         return \@results;
     }
 
@@ -118,6 +199,11 @@ class Database {
         my $embedding_service = EmbeddingService->new( config => $config );
         my $query_embedding =
           $embedding_service->get_embedding_for_text( $query, 'query' );
+            
+        unless ($query_embedding) {
+            $logger->log("Failed to generate embedding for query: $query", 'warning');
+            return [];
+        }
 
         # Now search for similar documents
         return $self->search_similar( $query_embedding, $limit );
@@ -126,63 +212,116 @@ class Database {
     method search_similar ( $query_embedding, $limit = 5 ) {
         $logger->log("Finding similar documents");
 
-        # Fetch all embeddings
-        my $sth = $dbh->prepare(
-            q{
-            SELECT e.document_id,
-                   e.chunk_index,
-                   e.chunk_text,
-                   e.embedding,
-                   d.title,
-                   d.path,
-                   d.content
-            FROM embeddings e
-            JOIN documents d ON e.document_id = d.id
-        }
-        );
-        $sth->execute();
+        if ($is_postgres && $query_embedding) {
+            # PostgreSQL with pg_vector native similarity search
+            
+            # Convert binary embedding to PostgreSQL vector array format
+            my @vec_values = unpack("f*", $query_embedding);
+            my $vec_string = '[' . join(',', @vec_values) . ']';
+            
+            # Use the <=> operator (cosine distance) for semantic similarity
+            # 1 - distance gives us similarity (0-1 range)
+            my $sth = $dbh->prepare(q{
+                SELECT 
+                    e.document_id,
+                    e.chunk_index,
+                    e.chunk_text,
+                    d.title,
+                    d.path,
+                    d.content,
+                    1 - (e.embedding <=> $1::vector) AS similarity
+                FROM embeddings e
+                JOIN documents d ON e.document_id = d.id
+                WHERE e.embedding IS NOT NULL
+                ORDER BY similarity DESC
+                LIMIT $2
+            });
+            
+            $sth->execute($vec_string, $limit);
+            
+            my @results;
+            while (my $row = $sth->fetchrow_hashref) {
+                # Truncate content if needed
+                my $max_content = 1000;    # Maximum characters to include
+                if ($row->{content} && length($row->{content}) > $max_content) {
+                    $row->{content} = substr($row->{content}, 0, $max_content) . "...";
+                }
+                
+                push @results, {
+                    document_id => $row->{document_id},
+                    chunk_index => $row->{chunk_index},
+                    chunk_text  => $row->{chunk_text},
+                    title       => $row->{title},
+                    path        => $row->{path},
+                    content     => $row->{content},
+                    similarity  => $row->{similarity}
+                };
+            }
+            
+            $logger->log("Found " . scalar(@results) . " similar documents using pg_vector");
+            return \@results;
+        } else {
+            # SQLite - in-memory similarity calculation
+            # Fetch all embeddings
+            my $sth = $dbh->prepare(
+                q{
+                SELECT e.document_id,
+                       e.chunk_index,
+                       e.chunk_text,
+                       e.embedding,
+                       d.title,
+                       d.path,
+                       d.content
+                FROM embeddings e
+                JOIN documents d ON e.document_id = d.id
+            }
+            );
+            $sth->execute();
 
-        my @results;
-        while ( my $row = $sth->fetchrow_hashref ) {
-            my $embedding = $row->{embedding};
-            my $similarity =
-              $self->cosine_similarity( $query_embedding, $embedding );
+            my @results;
+            while ( my $row = $sth->fetchrow_hashref ) {
+                my $embedding = $row->{embedding};
+                next unless $embedding && $query_embedding; # Skip rows without embeddings
+                
+                my $similarity =
+                  $self->cosine_similarity( $query_embedding, $embedding );
 
-            # Truncate content if needed
-            my $max_content = 1000;    # Maximum characters to include
-            if ( length( $row->{content} ) > $max_content ) {
-                $row->{content} =
-                  substr( $row->{content}, 0, $max_content ) . "...";
+                # Truncate content if needed
+                my $max_content = 1000;    # Maximum characters to include
+                if ( $row->{content} && length( $row->{content} ) > $max_content ) {
+                    $row->{content} =
+                      substr( $row->{content}, 0, $max_content ) . "...";
+                }
+
+                push @results,
+                  {
+                    document_id => $row->{document_id},
+                    chunk_index => $row->{chunk_index},
+                    chunk_text  => $row->{chunk_text},
+                    title       => $row->{title},
+                    path        => $row->{path},
+                    content     => $row->{content},
+                    similarity  => $similarity
+                  };
             }
 
-            push @results,
-              {
-                document_id => $row->{document_id},
-                chunk_index => $row->{chunk_index},
-                chunk_text  => $row->{chunk_text},
-                title       => $row->{title},
-                path        => $row->{path},
-                content     => $row->{content},
-                similarity  => $similarity
-              };
+            # Sort by similarity (highest first)
+            my @sorted_results =
+              sort { $b->{similarity} <=> $a->{similarity} } @results;
+
+            # Return top results
+            my $final_results = [
+                @sorted_results[
+                  0 .. (
+                      $limit - 1 < $#sorted_results ? $limit - 1 : $#sorted_results
+                  )
+                ]
+            ];
+
+            $logger->log(
+                "Found " . scalar(@$final_results) . " similar documents using in-memory comparison" );
+            return $final_results;
         }
-
-        # Sort by similarity (highest first)
-        my @sorted_results =
-          sort { $b->{similarity} <=> $a->{similarity} } @results;
-
-        # Return top results
-        my $final_results = [
-            @sorted_results[
-              0 .. (
-                  $limit - 1 < $#sorted_results ? $limit - 1 : $#sorted_results
-              )
-            ]
-        ];
-
-        $logger->log(
-            "Found " . scalar(@$final_results) . " similar documents" );
-        return $final_results;
     }
 
     method cosine_similarity ( $embedding1, $embedding2 ) {
@@ -328,7 +467,7 @@ class MCPServer {
                     version => $SERVER_VERSION
                 },
                 capabilities => {
-                    tools     => { listChanged => true }
+                    tools => { listChanged => true }
                 }
             }
         };
@@ -604,15 +743,45 @@ commonplace-mcp.pl - MCP server for searching Commonplace knowledge base
 =head1 DESCRIPTION
 
 An MCP (Model Context Protocol) server that provides tools for searching
-a personal knowledge base (commonplace.db) from Claude Desktop.
+a personal knowledge base from Claude Desktop, supporting both SQLite and PostgreSQL
+with pg_vector for efficient semantic similarity searches.
 
 =head1 USAGE
 
   ./commonplace-mcp.pl [options]
 
-  Options:
-    --db=PATH        Path to SQLite database (default: commonplace.db)
-    --debug          Enable debug output to stderr
+  Environment Variables:
+    DATABASE_DSN     Database connection string (default: SQLite in current dir)
+    DATABASE_USER    Database username (for PostgreSQL)
+    DATABASE_PASSWORD Database password (for PostgreSQL)
+    EMBEDDING_DIMENSIONS Dimensions for vector embeddings (default: 1536)
+    LOG_FILE         Optional path to log file
+
+=head1 DATABASE OPTIONS
+
+This server supports two database backends:
+
+=over 4
+
+=item * SQLite (default) - Simple file-based database, good for development and small deployments
+
+=item * PostgreSQL with pg_vector - High-performance database with native vector operations,
+recommended for production deployments with larger document collections
+
+=back
+
+For PostgreSQL, you'll need to:
+
+=over 4
+
+=item * Install the pg_vector extension in your PostgreSQL database
+
+=item * Set DATABASE_DSN to a PostgreSQL connection string, e.g.:
+dbi:Pg:dbname=commonplace;host=localhost;port=5432
+
+=item * Provide DATABASE_USER and DATABASE_PASSWORD if needed
+
+=back
 
 =head1 INTEGRATION WITH CLAUDE DESKTOP
 
@@ -622,26 +791,45 @@ To integrate with Claude Desktop:
    ~/Library/Application Support/Claude/claude_desktop_config.json (Mac)
    %AppData%\Claude\claude_desktop_config.json (Windows)
 
-2. Add your server configuration:
+2. Add your server configuration (SQLite example):
    {
      "mcpServers": {
        "commonplace": {
          "command": "perl",
          "args": [
-           "/path/to/commonplace-mcp.pl",
-           "--db=/path/to/commonplace.db"
-         ]
+           "/path/to/commonplace-mcp.pl"
+         ],
+         "env": {
+           "DATABASE_DSN": "dbi:SQLite:dbname=/path/to/commonplace.db"
+         }
        }
      }
    }
 
-3. Restart Claude Desktop
+3. Or for PostgreSQL with pg_vector:
+   {
+     "mcpServers": {
+       "commonplace": {
+         "command": "perl",
+         "args": [
+           "/path/to/commonplace-mcp.pl"
+         ],
+         "env": {
+           "DATABASE_DSN": "dbi:Pg:dbname=commonplace;host=localhost;port=5432",
+           "DATABASE_USER": "postgres",
+           "DATABASE_PASSWORD": "password"
+         }
+       }
+     }
+   }
+
+4. Restart Claude Desktop
 
 =head1 AVAILABLE TOOLS
 
 This server provides two tools:
 
-1. keyword_search - Traditional text search in your knowledge base
-2. semantic_search - Search using semantic similarity (vector search)
+1. keyword_search - Traditional text search in your knowledge base (using PostgreSQL full-text search or SQLite FTS)
+2. semantic_search - Search using semantic similarity (using pg_vector native operations for PostgreSQL or in-memory calculation for SQLite)
 
 =cut
