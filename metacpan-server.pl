@@ -1,6 +1,7 @@
 #!/usr/bin/env perl
 use 5.38.0;
 use experimental qw(class try builtin);
+use lib::xi;
 
 use FindBin;
 use local::lib "$FindBin::Bin/../local";

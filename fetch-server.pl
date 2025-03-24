@@ -1,6 +1,7 @@
 #!/usr/bin/env perl
 use 5.38.0;  # Downgraded from 5.40.0 for wider compatibility
 use experimental qw(class try builtin);
+use lib::xi;
 
 use FindBin;
 use IO::Handle;
@@ -280,9 +281,9 @@ class MCPServer {
         while ($buffer =~ s/^(.*)\n//) {
             my $line = $1;
             next unless $line =~ /\S/;    # Skip empty lines
-            
+
             $logger->log("Processing line: $line");
-            
+
             try {
                 my $message = decode_json($line);
                 $self->handle_message($message);
@@ -506,7 +507,7 @@ class MCPServer {
 
     method handle_get_prompt($request) {
         $logger->log("Handling prompts/get request");
-        
+
         # Since we're not supporting prompts right now, return an error
         $self->send_error(
             -32601,
@@ -541,10 +542,10 @@ class MCPServer {
     # Send a JSON-RPC error
     method send_error($code, $message, $id) {
         $logger->log("Sending error: $message (code: $code)");
-        
+
         # Ensure id is never null/undef
         $id = 0 unless defined $id;
-        
+
         my $error = {
             jsonrpc => "2.0",
             id      => $id,
@@ -553,7 +554,7 @@ class MCPServer {
                 message => $message
             }
         };
-        
+
         $self->send_message($error);
     }
 
